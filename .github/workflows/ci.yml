@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Shell Scripts Syntax
+        run: bash -n install.sh hooks/*.sh
+
+      - name: Run Full PAOS Unit & Integration Suite
+        run: python3 tests/test_paos.py
+
+      - name: End-to-End Isolated Home Install Test
+        run: |
+          FAKE_HOME="$(mktemp -d)"
+          HOME="$FAKE_HOME" ./install.sh
+          rm -rf "$FAKE_HOME"

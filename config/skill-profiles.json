@@ -1,0 +1,44 @@
+{
+  "always_keep": [
+    "daily-intel"
+  ],
+  "profiles": {
+    "minimal": {
+      "description": "极致精简档：仅保留核心通用主力（适合日常轻量对话，最低启动上下文）",
+      "keep": [
+        "mac-deep-clean",
+        "oss-picker"
+      ]
+    },
+    "writing": {
+      "description": "内容创作档：长文去 AI 味 + 配图引擎 + 推文发布工作流",
+      "keep": [
+        "*tweet*",
+        "*infographic*",
+        "*longform*",
+        "*post-to-x*",
+        "*xiaohei*",
+        "*publish*"
+      ]
+    },
+    "coding": {
+      "description": "软件工程档：TDD + 代码审查 + 架构拆解 + Bug 排查",
+      "keep": [
+        "tdd",
+        "code-review",
+        "diagnosing-bugs",
+        "codebase-design",
+        "git-guardrails*"
+      ]
+    },
+    "video": {
+      "description": "视觉与视频产线档：视频导演与动效编排技能",
+      "keep": [
+        "*video*",
+        "hyperframes",
+        "hyperframes-core",
+        "motion-graphics"
+      ]
+    }
+  }
+}

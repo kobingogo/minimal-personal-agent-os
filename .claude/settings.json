@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/load_recent_memory.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
