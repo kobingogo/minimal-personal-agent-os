@@ -609,6 +609,28 @@ class TestPaosKernelPrimitives(unittest.TestCase):
         c_ok = execute_cron_job_now("weekly-hygiene", repo_dir=REPO_ROOT, home_dir=self.home, notify=False)
         self.assertEqual(c_ok["status"], "ok")
 
+    def test_bundled_assets_in_sync_and_python_m_entrypoint(self) -> None:
+        assets_dir = REPO_ROOT / "lib" / "paos" / "assets"
+        pairs = [
+            (REPO_ROOT / "templates" / "claude-user-settings.json", assets_dir / "claude-user-settings.json"),
+            (REPO_ROOT / "templates" / "codex-paos.rules", assets_dir / "codex-paos.rules"),
+            (REPO_ROOT / "config" / "skill-profiles.json", assets_dir / "skill-profiles.json"),
+            (REPO_ROOT / "templates" / "brain" / "HEARTBEAT.md", assets_dir / "HEARTBEAT.md"),
+        ]
+        for src, bundled in pairs:
+            self.assertEqual(src.read_bytes(), bundled.read_bytes(), f"Asset drift: {bundled}")
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(REPO_ROOT / "lib")
+        r_mod = subprocess.run(
+            [sys.executable, "-m", "paos", "--version"],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertIn("paos 0.1.0", r_mod.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -21,6 +21,7 @@ from .audit import append_audit_event, paos_home, real_user_home, redact_secrets
 from .doctor import run_doctor
 from .harnesses import clean_harnesses, scan_matrix
 from .notify import send_notification
+from .resources import resolve_asset
 from .scheduler import exec_with_pgroup_timeout, run_task
 
 JOB_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
@@ -143,9 +144,15 @@ def build_launchd_plist(
     if weekday is not None:
         cal["Weekday"] = int(weekday)
 
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
+    prog_args = (
+        [sys.executable, "-B", str(paos_bin), "cron", "run-now", safe_name]
+        if paos_bin.is_file()
+        else [sys.executable, "-B", "-m", "paos", "cron", "run-now", safe_name]
+    )
     payload: Dict[str, Any] = {
         "Label": f"com.paos.{safe_name}",
-        "ProgramArguments": [sys.executable, "-B", str(paos_bin), "cron", "run-now", safe_name],
+        "ProgramArguments": prog_args,
         "WorkingDirectory": str(home),
         "StartCalendarInterval": cal,
         "ProcessType": "Background",
@@ -154,6 +161,7 @@ def build_launchd_plist(
         "EnvironmentVariables": {
             "PATH": _default_cron_path(home),
             "HOME": str(home),
+            "PYTHONPATH": pkg_parent,
         },
     }
     return plistlib.dumps(payload)
@@ -434,7 +442,7 @@ def execute_cron_job_now(
         else:
             hb_file = home / ".paos" / "brain" / "HEARTBEAT.md"
             if not hb_file.is_file():
-                hb_file = repo_dir / "templates" / "brain" / "HEARTBEAT.md"
+                hb_file = resolve_asset("templates/brain/HEARTBEAT.md", "HEARTBEAT.md")
             inbox_path = home / ".paos" / "brain" / "memory" / "INBOX.md"
             res = run_task(
                 prompt=f"只读阅读 {hb_file} 与 {inbox_path.parent}，输出最多 3 条简短巡检提醒（每行必须以 `- ` 开头），不要修改任何文件。",

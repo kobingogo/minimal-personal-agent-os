@@ -1,0 +1,92 @@
+{
+  "_comment": "Neutral starter profiles. Run `paos init` to generate `~/.paos/skill-profiles.json` tailored to your installed skills.",
+  "always_keep": [
+    "find-skills",
+    "*guide*",
+    "*custom*"
+  ],
+  "always_keep_agy_plugins": [
+    "agy-fast"
+  ],
+  "profiles": {
+    "minimal": {
+      "description": "精简问答档：仅保留高频检索与通用基础技能（跨端最低启动 Token 税）",
+      "keep": [
+        "*search*",
+        "*intel*",
+        "*clean*"
+      ],
+      "agy_plugins": []
+    },
+    "coding": {
+      "description": "软件工程档：TDD / 代码审查 / 调试排障 / 浏览器与工作流编排",
+      "keep": [
+        "*tdd*",
+        "*test*",
+        "*review*",
+        "*debug*",
+        "*design*",
+        "*git*",
+        "*devtools*",
+        "*workflow*"
+      ],
+      "agy_plugins": [
+        "*devtools*",
+        "*sdk*"
+      ]
+    },
+    "writing": {
+      "description": "内容创作档：长文写作 / 草稿排版 / 配图信息图 / 多源素材检索",
+      "keep": [
+        "*write*",
+        "*longform*",
+        "*article*",
+        "*draft*",
+        "*tweet*",
+        "*infographic*",
+        "*illustrat*",
+        "*cover*",
+        "*reach*",
+        "*intel*"
+      ],
+      "agy_plugins": [
+        "*devtools*"
+      ]
+    },
+    "video": {
+      "description": "视觉与视频档：动效合成 / 画布动画 / 音画混音与渲染套件",
+      "keep": [
+        "*video*",
+        "*frame*",
+        "*motion*",
+        "*animat*",
+        "*media*",
+        "*audio*"
+      ],
+      "agy_plugins": [
+        "*devtools*"
+      ]
+    },
+    "ops": {
+      "description": "协同办公档：云文档 / 表格 / 日历 / 会议纪要 / IM / 邮件套件",
+      "keep": [
+        "lark-*",
+        "*feishu*",
+        "*notion*",
+        "*slack*",
+        "*calendar*",
+        "*mail*"
+      ],
+      "agy_plugins": []
+    },
+    "all": {
+      "description": "全量恢复档：恢复挂载技能仓与插件包中全部可用项",
+      "keep": [
+        "*"
+      ],
+      "agy_plugins": [
+        "*"
+      ]
+    }
+  }
+}

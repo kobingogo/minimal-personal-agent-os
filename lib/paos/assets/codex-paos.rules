@@ -1,0 +1,56 @@
+# PAOS Cross-Harness Deterministic Guardrails for OpenAI Codex CLI / App
+# Managed by `paos harden --all` (validated via `codex execpolicy check`).
+# User rules in `~/.codex/rules/default.rules` remain untouched.
+
+# 1. Destructive root / home directory wipes -> FORBIDDEN
+prefix_rule(
+    pattern=["rm", ["-rf", "-fr", "-r", "--recursive"], ["/", "/*", "~", "~/", "~/*", "$HOME", ".."]],
+    decision="forbidden",
+    justification="PAOS: 禁止递归删除系统根目录、家目录或上级父目录",
+)
+prefix_rule(
+    pattern=["sudo", "rm", ["-rf", "-fr", "-r", "--recursive"], ["/", "/*", "~", "~/", "~/*", "$HOME", ".."]],
+    decision="forbidden",
+    justification="PAOS: 禁止提权递归删除系统根目录或家目录",
+)
+
+# 2. Git history destruction & force pushes -> FORBIDDEN
+prefix_rule(
+    pattern=["git", "push", ["-f", "--force", "--force-with-lease"]],
+    decision="forbidden",
+    justification="PAOS: 禁止自动执行 git push --force 覆盖远端历史，请改用新分支或由人工执行",
+)
+prefix_rule(
+    pattern=["git", "push", ["origin", "upstream"], ["-f", "--force", "--force-with-lease"]],
+    decision="forbidden",
+    justification="PAOS: 禁止向远端仓库执行 git push origin --force",
+)
+prefix_rule(
+    pattern=["git", "reset", "--hard"],
+    decision="forbidden",
+    justification="PAOS: 禁止自动执行 git reset --hard 丢弃未提交工作区改动",
+)
+prefix_rule(
+    pattern=["gh", "repo", "delete"],
+    decision="forbidden",
+    justification="PAOS: 禁止 Agent 删除远端 GitHub 仓库",
+)
+
+# 3. PixelLeak defense: require explicit human confirmation on any repo/gist creation
+prefix_rule(
+    pattern=["gh", "repo", "create"],
+    decision="prompt",
+    justification="PAOS: 创建远端仓库必须经人工确认（防范公开建仓泄密）",
+)
+prefix_rule(
+    pattern=["gh", "gist", "create"],
+    decision="prompt",
+    justification="PAOS: 创建 GitHub Gist 必须经人工确认（防范代码/截图外泄）",
+)
+
+# 4. Control-plane & guardrail self-tampering defense -> FORBIDDEN
+prefix_rule(
+    pattern=["rm", ["-f", "-rf", "-fr", "-r"], ["~/.codex/rules/paos-guardrails.rules", "~/.codex/rules", "~/.codex", "~/.claude", "~/.paos"]],
+    decision="forbidden",
+    justification="PAOS: 禁止 Agent 删除安全控制面目录或规则文件",
+)

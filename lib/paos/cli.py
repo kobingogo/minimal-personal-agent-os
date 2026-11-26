@@ -31,19 +31,16 @@ from .harnesses import (
     use_profile,
 )
 from .notify import send_notification
+from .resources import repo_root as _repo_root, resolve_asset
 from .scheduler import run_cold_review, run_task
 from .sync_bus import brain_root, init_brain, promote_learnings, sync_brain
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent
 
 
 def _default_profiles_file() -> Path:
     user_pf = paos_home() / ".paos" / "skill-profiles.json"
     if user_pf.is_file():
         return user_pf
-    return _repo_root() / "config" / "skill-profiles.json"
+    return resolve_asset("config/skill-profiles.json", "skill-profiles.json")
 
 
 def _fmt_bytes(num: int) -> str:
@@ -414,7 +411,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     seed = Path(args.seed_workspace).resolve() if args.seed_workspace else None
     res = init_brain(
         seed_workspace=seed,
-        repo_profiles_template=_repo_root() / "config" / "skill-profiles.json",
+        repo_profiles_template=resolve_asset("config/skill-profiles.json", "skill-profiles.json"),
     )
     print(f"=== PAOS Init 跨端共享大脑已就绪 ({res['brain_dir']}) ===")
     if res["created_files"]:

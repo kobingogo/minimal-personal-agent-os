@@ -1,5 +1,10 @@
 # minimal-personal-agent-os (`paos` v0.1.0)
 
+[![CI](https://github.com/kobingogo/minimal-personal-agent-os/actions/workflows/ci.yml/badge.svg)](https://github.com/kobingogo/minimal-personal-agent-os/actions/workflows/ci.yml)
+![Python 3.9+ Stdlib Only](https://img.shields.io/badge/python-3.9%2B%20stdlib%20only-3776AB)
+![Zero Dependencies](https://img.shields.io/badge/dependencies-0-2ea44f)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **零第三方依赖的个人 AI Agent 操作系统控制面（Agent 圈的 `nvm` + `chezmoi` + `systemd` 轻量内核）**。
 
 100% 基于 **Python 3.9+ 标准库 + POSIX Shell**（零 `pip` / `npm` 供应链依赖、零常驻后台守护进程、零入站监听端口），统一纳管本机 **Claude Code (`~/.claude`)、OpenAI Codex (`~/.codex`)、Shared Agents (`~/.agents`)、Google Antigravity (`~/.gemini`) 与 Cursor (`~/.cursor`)** 五大客户端。
@@ -17,6 +22,36 @@
 
 ---
 
+## 真实终端运行效果（1 秒透视五端启动税 + 50ms 跨端同步切档）
+
+```text
+$ paos matrix
+=== PAOS Matrix 跨客户端技能与状态全景报告 ===
+当前激活档位: coding | 真源仓: 74 个 (~/.paos/store/skills)
+五端累计启动税: ~11,165 Token (启用槽位合计 52 项 | 唯一技能 74 个)
+
+  客户端 (Harness)                启用  停放  断链 二级链     预估启动税
+  ------------------------------------------------------------------------
+  Claude Code                       11    63     0      0     ~2,340 tok
+  Codex CLI/App                     11    63     0      0     ~2,340 tok
+  Shared .agents                    11    63     0      0     ~2,340 tok
+  Antigravity                       11    63     0      0     ~2,340 tok
+  Cursor                             8    66     0      0     ~1,805 tok
+  Antigravity Plugins (config)       4     6     0      0     ~4,120 tok
+
+--- 跨端拓扑隐患诊断 ---
+  [PASS] 五大客户端零失效软链接
+  [PASS] 零跨客户端脆弱二级软链
+
+$ paos use minimal -p
+=== PAOS Use 跨端切档: [minimal] (已同步生效，重开对应客户端会话起效) ===
+  [Claude Code   ] 启用 11 ->  4 个 | 启动税 ~2,340 ->   ~810 tok (-1,530 tok) | 停放 -7 / 挂载 +0
+  [Codex CLI/App ] 启用 11 ->  4 个 | 启动税 ~2,340 ->   ~810 tok (-1,530 tok) | 停放 -7 / 挂载 +0
+  [AGY Plugins   ] 启用 +0 / 停用 -2 | 插件税变化 -2,640 tok
+```
+
+---
+
 ## 五大内核子系统全景（`v0.1.0`）
 
 | 内核子系统 | 核心命令 | 关键能力 |
@@ -31,25 +66,32 @@
 
 ## 前置环境要求
 
-- **操作系统**：macOS 或 Linux（Python `>= 3.9`，自带标准库即可，无需 `pip install`）
+- **操作系统**：macOS 或 Linux（Python `>= 3.9`，自带标准库即可，零第三方 `pip` 包依赖）
 - **基础工具**：`git`，以及至少安装并完成登录鉴权以下任一客户端 CLI：`claude`、`codex` 或 `agy`（Antigravity CLI）
 - **Linux 沙盒依赖提示**：`paos harden` 会开启 Claude 强制沙盒（`failIfUnavailable: true`），Linux 用户请确保系统已安装 `bubblewrap` (`bwrap`) 与 `socat`（macOS 使用系统内置 `sandbox-exec`，无需额外安装）
 
 ---
 
-## 30 秒快速上手
+## 30 秒快速安装
+
+### 路线 1：`uv` / `pipx` 一行全局安装（推荐）
+
+```bash
+uv tool install git+https://github.com/kobingogo/minimal-personal-agent-os
+# 或使用 pipx：pipx install git+https://github.com/kobingogo/minimal-personal-agent-os
+
+paos matrix                # 1 秒只读扫描本机五端现状与上下文税
+paos init && paos sync     # 初始化跨端共享大脑并无损挂载四端受管块
+paos harden --all          # 幂等加固 Claude 沙盒钩子 + Codex Starlark 门禁
+```
+
+### 路线 2：源码克隆 + 一键自检脚本
 
 ```bash
 git clone https://github.com/kobingogo/minimal-personal-agent-os.git ~/paos
 cd ~/paos
-
-# 方式 A：先零改动只读预览本机五端现状与加固 Diff
-./install.sh --dry-run
-
-# 方式 B：一键完成初始化共享大脑、四端规则挂载、双端门禁加固与自检
-./install.sh
-
-# 将 paos 挂入全局 PATH（请确保 ~/.local/bin 已加入你的 ~/.zshrc 或 ~/.bashrc）
+./install.sh --dry-run     # 先零改动只读预览五端矩阵与安全加固 Diff
+./install.sh               # 一键完成初始化、四端同步、双端门禁加固与 8 项隔离自检
 mkdir -p ~/.local/bin && ln -sf "$PWD/bin/paos" ~/.local/bin/paos
 ```
 

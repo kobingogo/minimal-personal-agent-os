@@ -10,9 +10,11 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from .audit import paos_home
+from .resources import resolve_asset
 
 HOOK_LAUNCHER_SPECS: Tuple[Tuple[str, str], ...] = (
     ("pre_tool_gate.py", "run_pre_tool_gate_main"),
@@ -31,8 +33,10 @@ def _dedup_extend(existing: List[Any], additions: List[Any]) -> List[Any]:
 
 
 def _load_claude_template(repo_dir: Optional[Path] = None) -> Dict[str, Any]:
-    root = repo_dir or Path(__file__).resolve().parent.parent.parent
-    tpl = root / "templates" / "claude-user-settings.json"
+    if repo_dir and (repo_dir / "templates" / "claude-user-settings.json").is_file():
+        tpl = repo_dir / "templates" / "claude-user-settings.json"
+    else:
+        tpl = resolve_asset("templates/claude-user-settings.json", "claude-user-settings.json")
     return json.loads(tpl.read_text(encoding="utf-8"))
 
 
@@ -140,7 +144,10 @@ def apply_codex_harden(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     home = paos_home(home_dir)
-    rules_src = repo_dir / "templates" / "codex-paos.rules"
+    if repo_dir and (repo_dir / "templates" / "codex-paos.rules").is_file():
+        rules_src = repo_dir / "templates" / "codex-paos.rules"
+    else:
+        rules_src = resolve_asset("templates/codex-paos.rules", "codex-paos.rules")
     new_text = rules_src.read_text(encoding="utf-8")
 
     codex_dir = home / ".codex"
@@ -188,18 +195,20 @@ def apply_codex_harden(
 
 
 def _deploy_hook_launchers(repo_dir: Path, hooks_dst: Path) -> List[str]:
-    """Write thin executable hook launchers in `~/.claude/hooks/` wired to `repo_dir / 'lib'`."""
-    lib_dir = str((repo_dir / "lib").resolve())
+    """Write thin executable hook launchers in `~/.claude/hooks/` wired to the active `paos` package parent."""
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
+    py_exe = sys.executable or "/usr/bin/env python3"
+    shebang = f"#!{py_exe}\n" if py_exe.startswith("/") else "#!/usr/bin/env python3\n"
     hooks_dst.mkdir(parents=True, exist_ok=True)
     deployed: List[str] = []
 
     for script_name, entry_fn in HOOK_LAUNCHER_SPECS:
         dst = hooks_dst / script_name
         content = (
-            "#!/usr/bin/env python3\n"
-            f'"""PAOS managed hook launcher -> {entry_fn}."""\n'
+            shebang
+            + f'"""PAOS managed hook launcher -> {entry_fn}."""\n'
             "import sys\n"
-            f"sys.path.insert(0, {lib_dir!r})\n"
+            f"sys.path.insert(0, {pkg_parent!r})\n"
             f"from paos.gate import {entry_fn}\n"
             'if __name__ == "__main__":\n'
             f"    sys.exit({entry_fn}())\n"
@@ -208,16 +217,13 @@ def _deploy_hook_launchers(repo_dir: Path, hooks_dst: Path) -> List[str]:
         os.chmod(dst, 0o755)
         deployed.append(str(dst))
 
-    hb_src = repo_dir / "hooks" / "heartbeat-run.sh"
-    if hb_src.is_file():
-        hb_dst = hooks_dst / "heartbeat-run.sh"
-        paos_bin = str((repo_dir / "bin" / "paos").resolve())
-        hb_dst.write_text(
-            f"#!/usr/bin/env bash\nset -euo pipefail\nexec {paos_bin!r} cron run-now heartbeat \"$@\"\n",
-            encoding="utf-8",
-        )
-        os.chmod(hb_dst, 0o755)
-        deployed.append(str(hb_dst))
+    hb_dst = hooks_dst / "heartbeat-run.sh"
+    hb_dst.write_text(
+        f"#!/usr/bin/env bash\nset -euo pipefail\nPYTHONPATH={pkg_parent!r} exec {py_exe!r} -B -m paos cron run-now heartbeat \"$@\"\n",
+        encoding="utf-8",
+    )
+    os.chmod(hb_dst, 0o755)
+    deployed.append(str(hb_dst))
 
     return deployed
 
