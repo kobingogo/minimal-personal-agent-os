@@ -1,4 +1,4 @@
-"""Idempotent security hardening across Claude Code & Codex CLI, deep JSON merge & rollback."""
+"""Idempotent security hardening across Claude Code & Codex CLI using `templates/` as single source of truth."""
 
 from __future__ import annotations
 
@@ -12,41 +12,13 @@ import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
-HOOK_FILES = (
-    "pre_tool_gate.py",
-    "load_recent_memory.py",
-    "stop_verify.py",
-    "block-destructive.sh",
-    "load-recent-memory.sh",
-    "heartbeat-run.sh",
-)
+from .audit import paos_home
 
-REQUIRED_DENY_READ = ["~/.ssh/**", "~/.aws/**", "~/.config/gh/**", "**/.env*"]
-REQUIRED_DENY_WRITE = ["~/.claude/**", "~/.codex/rules/**", "~/.paos/logs/**"]
-DEFAULT_ALLOWED_DOMAINS = [
-    "github.com",
-    "*.githubusercontent.com",
-    "registry.npmjs.org",
-    "api.npmjs.org",
-    "pypi.org",
-    "files.pythonhosted.org",
-]
-REQUIRED_PERMISSIONS_DENY = [
-    "Read(.env)",
-    "Read(.env.*)",
-    "Read(**/.env)",
-    "Read(**/.env.*)",
-    "Read(~/.ssh/**)",
-    "Read(~/.aws/**)",
-    "Read(~/.config/gh/**)",
-    "Read(~/.paos/config.json)",
-    "Write(~/.claude/**)",
-    "Edit(~/.claude/**)",
-    "Write(~/.codex/rules/**)",
-    "Edit(~/.codex/rules/**)",
-    "Write(~/.paos/logs/**)",
-    "Edit(~/.paos/logs/**)",
-]
+HOOK_LAUNCHER_SPECS: Tuple[Tuple[str, str], ...] = (
+    ("pre_tool_gate.py", "run_pre_tool_gate_main"),
+    ("stop_verify.py", "run_stop_verify_main"),
+    ("load_recent_memory.py", "run_session_start_main"),
+)
 GATE_COMMAND = "~/.claude/hooks/pre_tool_gate.py"
 
 
@@ -58,10 +30,18 @@ def _dedup_extend(existing: List[Any], additions: List[Any]) -> List[Any]:
     return out
 
 
-def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
-    """Non-destructively merge PAOS sandbox, permissions.deny & PreToolUse hook."""
+def _load_claude_template(repo_dir: Optional[Path] = None) -> Dict[str, Any]:
+    root = repo_dir or Path(__file__).resolve().parent.parent.parent
+    tpl = root / "templates" / "claude-user-settings.json"
+    return json.loads(tpl.read_text(encoding="utf-8"))
+
+
+def merge_claude_settings(current: Dict[str, Any], repo_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Non-destructively merge `templates/claude-user-settings.json` into `current`."""
+    tpl = _load_claude_template(repo_dir)
     merged = copy.deepcopy(current) if isinstance(current, dict) else {}
 
+    tpl_sb = tpl["sandbox"]
     sb = merged.setdefault("sandbox", {})
     if not isinstance(sb, dict):
         sb = {}
@@ -74,21 +54,21 @@ def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(fs, dict):
         fs = {}
         sb["filesystem"] = fs
-    fs["denyRead"] = _dedup_extend(list(fs.get("denyRead") or []), REQUIRED_DENY_READ)
-    fs["denyWrite"] = _dedup_extend(list(fs.get("denyWrite") or []), REQUIRED_DENY_WRITE)
+    fs["denyRead"] = _dedup_extend(fs.get("denyRead") or [], tpl_sb["filesystem"]["denyRead"])
+    fs["denyWrite"] = _dedup_extend(fs.get("denyWrite") or [], tpl_sb["filesystem"]["denyWrite"])
 
     net = sb.setdefault("network", {})
     if not isinstance(net, dict):
         net = {}
         sb["network"] = net
     if not net.get("allowedDomains"):
-        net["allowedDomains"] = list(DEFAULT_ALLOWED_DOMAINS)
+        net["allowedDomains"] = list(tpl_sb["network"]["allowedDomains"])
 
     perms = merged.setdefault("permissions", {})
     if not isinstance(perms, dict):
         perms = {}
         merged["permissions"] = perms
-    perms["deny"] = _dedup_extend(list(perms.get("deny") or []), REQUIRED_PERMISSIONS_DENY)
+    perms["deny"] = _dedup_extend(perms.get("deny") or [], tpl["permissions"]["deny"])
 
     hooks = merged.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -99,6 +79,7 @@ def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
         pre_list = []
         hooks["PreToolUse"] = pre_list
 
+    target_matcher = tpl["hooks"]["PreToolUse"][0]["matcher"]
     already_wired = False
     for entry in pre_list:
         if not isinstance(entry, dict):
@@ -110,58 +91,46 @@ def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
                     k in str(h.get("command") or "")
                     for k in ("pre_tool_gate.py", "block-destructive.sh")
                 ):
+                    h["command"] = GATE_COMMAND
+                    entry["matcher"] = target_matcher
                     already_wired = True
                     break
 
     if not already_wired:
-        pre_list.append(
-            {
-                "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": GATE_COMMAND,
-                    }
-                ],
-            }
-        )
+        pre_list.append(copy.deepcopy(tpl["hooks"]["PreToolUse"][0]))
 
     return merged
 
 
 def verify_codex_rules_file(rules_path: Path) -> Tuple[bool, List[str]]:
-    """Validate Starlark rules via `codex execpolicy check` if `codex` CLI is installed."""
     codex_bin = shutil.which("codex")
     if not codex_bin:
-        return (True, ["codex CLI 未安装，已跳过编译器静态校验（语法符合 Starlark prefix_rule 规范）"])
+        return (True, ["codex CLI 未安装，已仅校验模板文件完整性"])
 
-    probes = [
+    checks = [
         (["rm", "-rf", "/"], "forbidden"),
         (["git", "push", "-f", "origin", "main"], "forbidden"),
+        (["git", "push", "origin", "--force"], "forbidden"),
         (["git", "reset", "--hard", "HEAD~1"], "forbidden"),
         (["gh", "repo", "create", "leak-demo", "--public"], "prompt"),
     ]
     details: List[str] = []
-    for cmd_tokens, expected_decision in probes:
+    for cmd_tokens, expected in checks:
         res = subprocess.run(
             [codex_bin, "execpolicy", "check", "--rules", str(rules_path), "--", *cmd_tokens],
-            text=True,
             capture_output=True,
-            timeout=10,
+            text=True,
+            timeout=8,
         )
         if res.returncode != 0:
-            return (False, [f"codex execpolicy check 失败: {res.stderr.strip()}"])
+            return (False, [f"codex execpolicy check 语法错误: {res.stderr.strip()}"])
         try:
-            parsed = json.loads(res.stdout)
+            decision = json.loads(res.stdout).get("decision")
         except Exception:
-            return (False, [f"codex execpolicy 输出无法解析: {res.stdout[:120]}"])
-        actual = parsed.get("decision")
-        if actual != expected_decision:
-            return (
-                False,
-                [f"命令 `{' '.join(cmd_tokens)}` 期望决策 {expected_decision}，实际得到 {actual}"],
-            )
-        details.append(f"[PASS] {' '.join(cmd_tokens)} -> {actual}")
+            decision = None
+        if decision != expected:
+            return (False, [f"规则决策不匹配 `{' '.join(cmd_tokens)}`: 期望 {expected}, 实际 {decision}"])
+        details.append(f"[PASS] {' '.join(cmd_tokens)} -> {decision}")
     return (True, details)
 
 
@@ -170,8 +139,7 @@ def apply_codex_harden(
     home_dir: Optional[Path] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Install non-destructive `~/.codex/rules/paos-guardrails.rules` without touching `default.rules`."""
-    home = home_dir or Path.home()
+    home = paos_home(home_dir)
     rules_src = repo_dir / "templates" / "codex-paos.rules"
     new_text = rules_src.read_text(encoding="utf-8")
 
@@ -179,6 +147,11 @@ def apply_codex_harden(
     rules_dir = codex_dir / "rules"
     dst = rules_dir / "paos-guardrails.rules"
     backups_dir = codex_dir / "backups"
+
+    # Validate Starlark template BEFORE touching user's `~/.codex/rules/`!
+    verified_ok, verify_details = verify_codex_rules_file(rules_src)
+    if not verified_ok:
+        raise RuntimeError("Codex Starlark 门禁模板预校验未通过: " + "; ".join(verify_details))
 
     current_text = dst.read_text(encoding="utf-8") if dst.is_file() else ""
     diff_lines = list(
@@ -192,18 +165,16 @@ def apply_codex_harden(
     changed = bool(diff_lines) or not dst.is_file()
     backup_path: Optional[Path] = None
 
-    if not dry_run:
-        if dst.is_file() and diff_lines:
-            backups_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if not dry_run and changed:
+        backups_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if dst.is_file():
             backup_path = backups_dir / f"paos-guardrails-{ts}.rules.bak"
             shutil.copy2(dst, backup_path)
-        if changed:
-            rules_dir.mkdir(parents=True, exist_ok=True)
-            dst.write_text(new_text, encoding="utf-8")
-
-    verify_target = dst if (not dry_run and dst.is_file()) else rules_src
-    verified_ok, verify_details = verify_codex_rules_file(verify_target)
+        else:
+            (backups_dir / f"paos-guardrails-{ts}.empty.bak").write_text("", encoding="utf-8")
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        dst.write_text(new_text, encoding="utf-8")
 
     return {
         "dry_run": dry_run,
@@ -216,14 +187,49 @@ def apply_codex_harden(
     }
 
 
+def _deploy_hook_launchers(repo_dir: Path, hooks_dst: Path) -> List[str]:
+    """Write thin executable hook launchers in `~/.claude/hooks/` wired to `repo_dir / 'lib'`."""
+    lib_dir = str((repo_dir / "lib").resolve())
+    hooks_dst.mkdir(parents=True, exist_ok=True)
+    deployed: List[str] = []
+
+    for script_name, entry_fn in HOOK_LAUNCHER_SPECS:
+        dst = hooks_dst / script_name
+        content = (
+            "#!/usr/bin/env python3\n"
+            f'"""PAOS managed hook launcher -> {entry_fn}."""\n'
+            "import sys\n"
+            f"sys.path.insert(0, {lib_dir!r})\n"
+            f"from paos.gate import {entry_fn}\n"
+            'if __name__ == "__main__":\n'
+            f"    sys.exit({entry_fn}())\n"
+        )
+        dst.write_text(content, encoding="utf-8")
+        os.chmod(dst, 0o755)
+        deployed.append(str(dst))
+
+    hb_src = repo_dir / "hooks" / "heartbeat-run.sh"
+    if hb_src.is_file():
+        hb_dst = hooks_dst / "heartbeat-run.sh"
+        paos_bin = str((repo_dir / "bin" / "paos").resolve())
+        hb_dst.write_text(
+            f"#!/usr/bin/env bash\nset -euo pipefail\nexec {paos_bin!r} cron run-now heartbeat \"$@\"\n",
+            encoding="utf-8",
+        )
+        os.chmod(hb_dst, 0o755)
+        deployed.append(str(hb_dst))
+
+    return deployed
+
+
 def apply_harden(
     repo_dir: Path,
-    home_dir: Path | None = None,
+    home_dir: Optional[Path] = None,
     dry_run: bool = False,
     configure_git: bool = True,
     include_codex: bool = False,
 ) -> Dict[str, Any]:
-    home = home_dir or Path.home()
+    home = paos_home(home_dir)
     claude_dir = home / ".claude"
     hooks_dst = claude_dir / "hooks"
     backups_dir = claude_dir / "backups"
@@ -240,7 +246,7 @@ def apply_harden(
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{settings_path} JSON 语法损坏，拒绝覆盖: {exc}") from exc
 
-    merged_obj = merge_claude_settings(current_obj)
+    merged_obj = merge_claude_settings(current_obj, repo_dir=repo_dir)
     new_text = json.dumps(merged_obj, ensure_ascii=False, indent=2) + "\n"
     diff_lines = list(
         difflib.unified_diff(
@@ -252,31 +258,21 @@ def apply_harden(
     )
 
     deployed_hooks: List[str] = []
-    backup_path: Path | None = None
-    gitignore_file: Path | None = None
-    gitignore_warning: str | None = None
+    backup_path: Optional[Path] = None
+    gitignore_file: Optional[Path] = None
+    gitignore_warning: Optional[str] = None
 
     if not dry_run:
-        hooks_dst.mkdir(parents=True, exist_ok=True)
-        for name in HOOK_FILES:
-            src = repo_dir / "hooks" / name
-            if src.is_file():
-                dst = hooks_dst / name
-                shutil.copy2(src, dst)
-                os.chmod(dst, 0o755)
-                deployed_hooks.append(str(dst))
-
-        if settings_path.is_file() and diff_lines:
-            backups_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup_path = backups_dir / f"settings-{ts}.json.bak"
-            shutil.copy2(settings_path, backup_path)
-        elif not settings_path.is_file():
-            backups_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            (backups_dir / f"settings-{ts}.empty.bak").write_text("", encoding="utf-8")
+        deployed_hooks = _deploy_hook_launchers(repo_dir, hooks_dst)
 
         if diff_lines or not settings_path.is_file():
+            backups_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            if settings_path.is_file():
+                backup_path = backups_dir / f"settings-{ts}.json.bak"
+                shutil.copy2(settings_path, backup_path)
+            else:
+                (backups_dir / f"settings-{ts}.empty.bak").write_text("", encoding="utf-8")
             claude_dir.mkdir(parents=True, exist_ok=True)
             settings_path.write_text(new_text, encoding="utf-8")
 
@@ -303,6 +299,14 @@ def apply_harden(
     }
 
 
+def _expand_home_prefix(path_str: str, home: Path) -> Path:
+    if path_str == "~":
+        return home
+    if path_str.startswith("~/"):
+        return home / path_str[2:]
+    return Path(os.path.expanduser(path_str))
+
+
 def _write_ignore_rule(target: Path, rule: str = ".claude/settings.local.json") -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     lines = target.read_text(encoding="utf-8").splitlines() if target.is_file() else []
@@ -315,7 +319,6 @@ def _write_ignore_rule(target: Path, rule: str = ".claude/settings.local.json") 
 
 
 def ensure_global_gitignore(home: Path) -> Path:
-    """Ensure `.claude/settings.local.json` is excluded in global gitignore."""
     env = os.environ.copy()
     env["HOME"] = str(home)
     existing = ""
@@ -334,14 +337,14 @@ def ensure_global_gitignore(home: Path) -> Path:
 
     candidates: List[Path] = []
     if existing:
-        candidates.append(Path(os.path.expanduser(existing.replace("~", str(home), 1))))
+        candidates.append(_expand_home_prefix(existing, home))
     candidates.extend([home / ".config" / "git" / "ignore", home / ".gitignore_global"])
 
-    last_err: OSError | None = None
+    last_err: Optional[OSError] = None
     for target in candidates:
         try:
             _write_ignore_rule(target)
-            if not existing or Path(os.path.expanduser(existing.replace("~", str(home), 1))) != target:
+            if not existing or _expand_home_prefix(existing, home) != target:
                 subprocess.run(
                     ["git", "config", "--global", "core.excludesfile", str(target)],
                     env=env,
@@ -359,42 +362,50 @@ def ensure_global_gitignore(home: Path) -> Path:
     return home / ".gitignore_global"
 
 
-def rollback_settings(home_dir: Path | None = None, include_codex: bool = False) -> Tuple[bool, str]:
-    home = home_dir or Path.home()
-    msgs: List[str] = []
-    any_ok = False
+def _restore_latest_backup(backups_dir: Path, prefix: str, target_path: Path, label: str) -> Tuple[bool, str]:
+    if not backups_dir.is_dir():
+        return (False, f"[{label}] 未找到备份目录 {backups_dir}。")
 
-    backups_dir = home / ".claude" / "backups"
-    settings_path = home / ".claude" / "settings.json"
-    candidates = sorted(backups_dir.glob("settings-*.json.bak")) if backups_dir.is_dir() else []
-    empty_sentinels = sorted(backups_dir.glob("settings-*.empty.bak")) if backups_dir.is_dir() else []
-    if candidates:
-        latest = candidates[-1]
-        shutil.copy2(latest, settings_path)
-        msgs.append(f"[Claude] 已从 {latest} 恢复 {settings_path}")
-        any_ok = True
-    elif empty_sentinels and settings_path.is_file():
-        settings_path.unlink()
-        msgs.append(f"[Claude] 已移除首次生成的配置文件 {settings_path}")
-        any_ok = True
-    else:
-        msgs.append("[Claude] 未找到可回滚的 settings 备份文件。")
+    all_baks = sorted(backups_dir.glob(f"{prefix}-*.bak"), key=lambda p: p.name)
+    if not all_baks:
+        return (False, f"[{label}] 未找到可回滚的备份文件。")
+
+    latest = all_baks[-1]
+    if target_path.is_file():
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(target_path, backups_dir / f"pre-rollback-{ts}-{target_path.name}")
+
+    if latest.name.endswith(".empty.bak"):
+        if target_path.is_file():
+            target_path.unlink()
+        latest.unlink(missing_ok=True)
+        return (True, f"[{label}] 已回滚移除首次生成的配置文件 {target_path}")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(latest, target_path)
+    return (True, f"[{label}] 已从 {latest} 恢复 {target_path}")
+
+
+def rollback_settings(home_dir: Optional[Path] = None, include_codex: bool = False) -> Tuple[bool, str]:
+    home = paos_home(home_dir)
+    msgs: List[str] = []
+    ok_c, msg_c = _restore_latest_backup(
+        home / ".claude" / "backups",
+        "settings",
+        home / ".claude" / "settings.json",
+        "Claude",
+    )
+    msgs.append(msg_c)
+    any_ok = ok_c
 
     if include_codex:
-        codex_bak_dir = home / ".codex" / "backups"
-        codex_rules_path = home / ".codex" / "rules" / "paos-guardrails.rules"
-        codex_baks = sorted(codex_bak_dir.glob("paos-guardrails-*.rules.bak")) if codex_bak_dir.is_dir() else []
-        if codex_baks:
-            latest_c = codex_baks[-1]
-            codex_rules_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(latest_c, codex_rules_path)
-            msgs.append(f"[Codex] 已从 {latest_c} 恢复 {codex_rules_path}")
-            any_ok = True
-        elif codex_rules_path.is_file():
-            codex_rules_path.unlink()
-            msgs.append(f"[Codex] 已移除首次生成的门禁规则 {codex_rules_path}")
-            any_ok = True
-        else:
-            msgs.append("[Codex] 未找到可回滚的 paos-guardrails.rules 备份或规则文件。")
+        ok_x, msg_x = _restore_latest_backup(
+            home / ".codex" / "backups",
+            "paos-guardrails",
+            home / ".codex" / "rules" / "paos-guardrails.rules",
+            "Codex",
+        )
+        msgs.append(msg_x)
+        any_ok = any_ok or ok_x
 
     return (any_ok, "\n".join(msgs))

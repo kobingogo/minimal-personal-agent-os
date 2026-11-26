@@ -1,11 +1,4 @@
-"""Zero-inbound-port outbound notification bus with mandatory DLP secret redaction.
-
-Supports:
-  - `macos`: Native macOS Notification Center (`osascript`)
-  - `feishu` / `lark`: Feishu custom bot webhook (`PAOS_FEISHU_WEBHOOK` or `~/.paos/config.json`)
-  - `telegram`: Telegram Bot API (`PAOS_TELEGRAM_BOT_TOKEN` + `PAOS_TELEGRAM_CHAT_ID`)
-  - `webhook`: Generic JSON POST (`PAOS_WEBHOOK_URL`)
-"""
+"""Zero-inbound-port outbound notification bus with mandatory DLP secret redaction."""
 
 from __future__ import annotations
 
@@ -13,13 +6,12 @@ import json
 import os
 from pathlib import Path
 import platform
-import pwd
 import subprocess
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-from .audit import append_audit_event, redact_secrets
+from .audit import append_audit_event, paos_home, real_user_home, redact_secrets, redact_truncate
 
 TupleResult = Tuple[bool, str]
 
@@ -48,23 +40,23 @@ def _post_json(url: str, payload: Dict[str, Any], timeout_sec: int = 10) -> Tupl
             status = getattr(resp, "status", 200)
             resp_body = resp.read(1024).decode("utf-8", errors="replace")
             if not (200 <= status < 300):
-                return (False, f"HTTP {status}: {redact_secrets(resp_body)[:120]}")
+                return (False, f"HTTP {status}: {redact_truncate(resp_body, 120)}")
             try:
                 parsed = json.loads(resp_body)
                 if isinstance(parsed, dict):
                     for code_key in ("code", "StatusCode"):
                         if code_key in parsed and parsed[code_key] != 0:
-                            return (False, f"API {code_key}={parsed[code_key]}: {redact_secrets(resp_body)[:120]}")
+                            return (False, f"API {code_key}={parsed[code_key]}: {redact_truncate(resp_body, 120)}")
                     if parsed.get("ok") is False:
-                        return (False, f"API ok=false: {redact_secrets(resp_body)[:120]}")
+                        return (False, f"API ok=false: {redact_truncate(resp_body, 120)}")
             except Exception:
                 pass
-            return (True, f"HTTP {status}: {redact_secrets(resp_body)[:120]}")
+            return (True, f"HTTP {status}: {redact_truncate(resp_body, 120)}")
     except urllib.error.HTTPError as exc:
         err_txt = exc.read(512).decode("utf-8", errors="replace")
-        return (False, f"HTTP {exc.code}: {redact_secrets(err_txt)[:160]}")
+        return (False, f"HTTP {exc.code}: {redact_truncate(err_txt, 160)}")
     except Exception as exc:
-        return (False, redact_secrets(str(exc)))
+        return (False, redact_truncate(str(exc), 160))
 
 
 def _escape_applescript(val: str) -> str:
@@ -79,10 +71,9 @@ def send_notification(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Send an outbound DLP-redacted notification across configured channel(s)."""
-    home = (home_dir or Path.home()).resolve()
+    home = paos_home(home_dir)
     cfg = _load_notify_config(home)
 
-    # Mandatory outbound DLP scrub: NEVER transmit raw secrets externally!
     safe_title = redact_secrets(title).strip() or "PAOS 通知"
     safe_msg = redact_secrets(message).strip()
 
@@ -95,8 +86,7 @@ def send_notification(
     env_ch = os.environ.get("PAOS_NOTIFY_CHANNEL") or cfg.get("default_channel")
     eff_channel = env_ch if (channel == "auto" and env_ch) else channel
     if eff_channel == "auto":
-        real_pw_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
-        if platform.system() == "Darwin" and home == real_pw_home and os.environ.get("PAOS_NO_OSASCRIPT") != "1":
+        if platform.system() == "Darwin" and home == real_user_home() and os.environ.get("PAOS_NO_OSASCRIPT") != "1":
             chosen.append("macos")
         if feishu_url:
             chosen.append("feishu")
@@ -190,7 +180,7 @@ def send_notification(
         append_audit_event(
             event_type="notify",
             status="ok" if overall_ok else "failed",
-            summary=f"{safe_title}: {safe_msg[:120]}",
+            summary=f"{safe_title}: {redact_truncate(safe_msg, 120)}",
             extra={"channels": [r["channel"] for r in results]},
             home_dir=home,
         )

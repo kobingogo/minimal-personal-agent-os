@@ -1,4 +1,4 @@
-"""5-dimension read-only health, context-bloat, and security posture auditor."""
+"""5-dimension read-only health, context-bloat, and cross-harness security posture auditor."""
 
 from __future__ import annotations
 
@@ -7,31 +7,14 @@ import glob
 import json
 import os
 from pathlib import Path
-import re
 import shlex
 import shutil
 import subprocess
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
-from .skills import list_skills
-
-INLINE_SECRET_PATTERNS = [
-    ("OpenAI/Anthropic/API Key", re.compile(r"\bsk-[a-zA-Z0-9_-]{12,}")),
-    ("GitHub PAT", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{16,}|\bgithub_pat_[a-zA-Z0-9_]{16,}")),
-    ("Google API Key", re.compile(r"\bAIza[a-zA-Z0-9_-]{16,}")),
-    ("Slack/Telegram Token", re.compile(r"\bxox[baprs]-[a-zA-Z0-9-]{12,}|\b(?:bot)?\d{8,12}:[A-Za-z0-9_-]{30,}")),
-    ("URI Password", re.compile(r"\b(?:postgres|postgresql|mysql|mongodb|redis|https?)://[^/\s:@]+:[^/\s@]+@")),
-    (
-        "Inline Secret Assignment",
-        re.compile(
-            r"\b(?:[A-Za-z0-9_]+_)?(?:PASSWORD|PASSWD|API_KEY|APIKEY|AUTH_TOKEN|ACCESS_TOKEN|SECRET_KEY|PRIVATE_KEY|BOT_TOKEN|WEBHOOK_URL|CLIENT_SECRET|ACCESS_KEY)\b\s*[:=]\s*['\"]?[^\s'\"&,;}\]]{4,}",
-            re.I,
-        ),
-    ),
-]
-
-TAG_RE = re.compile(r"\[tag:([a-zA-Z0-9_-]+)\]")
-PROMOTED_RE = re.compile(r"\[promoted:")
+from .audit import paos_home, scan_text_for_secrets
+from .harnesses import list_skills, scan_matrix
+from .sync_bus import scan_unpromoted_tags
 
 
 class Finding:
@@ -50,42 +33,42 @@ class Finding:
         }
 
 
-def _expand_user(path_str: str, home: Path) -> Path:
-    if path_str.startswith("~/"):
-        return home / path_str[2:]
-    return Path(os.path.expanduser(path_str))
+def _expand_user_path(path_str: str, home: Path) -> Path:
+    s = path_str.strip()
+    if s == "~":
+        return home
+    if s.startswith("~/"):
+        return home / s[2:]
+    if s.startswith("$HOME/"):
+        return home / s[6:]
+    if s.startswith("${HOME}/"):
+        return home / s[8:]
+    return Path(os.path.expanduser(s))
 
 
 def _scan_settings_local_for_secrets(path: Path) -> List[str]:
-    """Scan a settings.local.json file for inline secrets WITHOUT returning secret values."""
     if not path.is_file():
         return []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
-
-    hits: List[str] = []
-    for idx, line in enumerate(text.splitlines(), 1):
-        for label, pat in INLINE_SECRET_PATTERNS:
-            if pat.search(line):
-                hits.append(f"第 {idx} 行命中疑似「{label}」（内容已脱敏隐藏）")
-                break
-    return hits
+    return scan_text_for_secrets(text)
 
 
-def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> Dict[str, Any]:
-    home = home_dir or Path.home()
+def run_doctor(workspace: Optional[Path] = None, home_dir: Optional[Path] = None) -> Dict[str, Any]:
+    home = paos_home(home_dir)
     ws = (workspace or Path.cwd()).resolve()
     findings: List[Finding] = []
 
     # =========================================================================
-    # Dimension 1: Context & Memory Bloat Audit
+    # Dimension 1: Cross-Harness Context & Memory Bloat Audit
     # =========================================================================
     sk = list_skills(home)
+    mat = scan_matrix(home)
     active_n = sk["active_count"]
     parked_n = sk["parked_count"]
-    broken_n = sk["broken_active_count"]
+    broken_n = mat["totals"]["broken_symlinks"]
     est_tok = sk["estimated_active_tokens"]
 
     if broken_n > 0:
@@ -93,8 +76,8 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
             Finding(
                 "WARN",
                 "context",
-                f"~/.claude/skills 中存在 {broken_n} 个失效软链接",
-                "运行 `paos skills clean-broken` 自动移入 skills-off/",
+                f"五大客户端中检测到 {broken_n} 个失效技能软链接",
+                "运行 `paos clean` 或 `paos adopt` 自动治愈/隔离失效软链",
             )
         )
     if active_n > 15:
@@ -102,8 +85,8 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
             Finding(
                 "WARN",
                 "context",
-                f"常驻用户 Skill 过多（当前 {active_n} 个，预估启动占用 ~{est_tok} Token；已停放 {parked_n} 个）",
-                "运行 `paos skills list` 或 `paos skills profile minimal` 仅保留 <=10 个高频主力",
+                f"常驻用户 Skill 过多（Claude 当前 {active_n} 个，预估启动占用 ~{est_tok} Token；已停放 {parked_n} 个）",
+                "先运行 `paos adopt` 建立一级真源，再运行 `paos use minimal` 按场景切档（避免单端挪目录引发断链）",
             )
         )
     else:
@@ -115,7 +98,6 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
             )
         )
 
-    # Check ~/.claude.json state bloat separately from prompt rule files
     claude_state_json = home / ".claude.json"
     if claude_state_json.is_file():
         sz_kb = claude_state_json.stat().st_size / 1024.0
@@ -129,22 +111,6 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                 )
             )
 
-    # Check shared ~/.agents/skills & ~/.codex/skills broken symlinks
-    for label, extra_dir in [("~/.agents/skills", home / ".agents" / "skills"), ("~/.codex/skills", home / ".codex" / "skills")]:
-        if extra_dir.is_dir():
-            entries = [n for n in os.listdir(extra_dir) if not n.startswith(".")]
-            dead = [n for n in entries if (extra_dir / n).is_symlink() and not (extra_dir / n).exists()]
-            if dead:
-                findings.append(
-                    Finding(
-                        "WARN",
-                        "context",
-                        f"{label} 中存在 {len(dead)} 个失效软链接（共 {len(entries)} 项）",
-                        f"清理失效链接: {', '.join(dead[:5])}",
-                    )
-                )
-
-    # Check global rule files bloat (actual upfront LLM token tax)
     for rel_label, p, limit_kb in [
         ("~/.claude/CLAUDE.md", home / ".claude" / "CLAUDE.md", 12),
         ("~/.codex/AGENTS.md", home / ".codex" / "AGENTS.md", 12),
@@ -164,7 +130,6 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     )
                 )
 
-    # Check MEMORY.md 200-line / 25KB hard cliff across workspace, shared brain & ~/.claude/projects
     raw_mem_candidates = [
         ws / "memory" / "MEMORY.md",
         home / ".paos" / "brain" / "memory" / "MEMORY.md",
@@ -202,9 +167,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
             )
         )
     else:
-        findings.append(
-            Finding("PASS", "context", "所有已扫描 MEMORY.md 均控制在 200 行 / 25KB 截断线以内")
-        )
+        findings.append(Finding("PASS", "context", "所有已扫描 MEMORY.md 均控制在 200 行 / 25KB 截断线以内"))
 
     # =========================================================================
     # Dimension 2: OS Sandbox & Permission Hardening
@@ -218,7 +181,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                 "FAIL",
                 "sandbox",
                 "未检测到 ~/.claude/settings.json，当前终端 Agent 处于无沙盒裸奔状态",
-                "运行 `paos harden` 一键部署沙盒、权限锁与防呆钩子",
+                "运行 `paos harden --all` 一键部署沙盒、权限锁与防呆钩子",
             )
         )
     else:
@@ -240,7 +203,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
         sb = settings_obj.get("sandbox") or {}
         if not isinstance(sb, dict) or not sb.get("enabled"):
             findings.append(
-                Finding("FAIL", "sandbox", "未开启 OS 级沙盒 (`sandbox.enabled != true`)", "运行 `paos harden`")
+                Finding("FAIL", "sandbox", "未开启 OS 级沙盒 (`sandbox.enabled != true`)", "运行 `paos harden --all`")
             )
         else:
             escapes: List[str] = []
@@ -250,7 +213,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                 escapes.append("failIfUnavailable 未设为 true（缺依赖时会静默降级）")
             if escapes:
                 findings.append(
-                    Finding("FAIL", "sandbox", "沙盒存在逃生隐患：" + "；".join(escapes), "运行 `paos harden` 自动补齐")
+                    Finding("FAIL", "sandbox", "沙盒存在逃生隐患：" + "；".join(escapes), "运行 `paos harden --all` 自动补齐")
                 )
             else:
                 findings.append(Finding("PASS", "sandbox", "OS 级沙盒已启用且已封死默认逃生舱"))
@@ -258,13 +221,13 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
         fs = (sb.get("filesystem") if isinstance(sb, dict) else None) or {}
         deny_read = " ".join(str(x) for x in (fs.get("denyRead") or []))
         deny_write = " ".join(str(x) for x in (fs.get("denyWrite") or []))
-        missing_dr = [k for k in (".ssh", ".aws", ".env") if k not in deny_read]
+        missing_dr = [k for k in (".ssh", ".aws", ".env", ".paos/config.json") if k not in deny_read]
         if missing_dr:
             findings.append(
                 Finding(
                     "WARN",
                     "sandbox",
-                    f"sandbox.filesystem.denyRead 未覆盖敏感路径：{', '.join(missing_dr)}",
+                    f"sandbox.filesystem.denyRead 未完整覆盖敏感凭据路径：{', '.join(missing_dr)}",
                     "运行 `paos harden` 补齐 denyRead 列表",
                 )
             )
@@ -274,7 +237,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     "WARN",
                     "sandbox",
                     "sandbox.filesystem.denyWrite 未锁死 ~/.claude/**（Agent 子进程可篡改自身护栏）",
-                    "运行 `paos harden` 锁定 ~/.claude/**",
+                    "运行 `paos harden` 锁定控制面目录",
                 )
             )
 
@@ -289,7 +252,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                 )
             )
         else:
-            findings.append(Finding("PASS", "sandbox", "内置 Read(.env) 与 ~/.claude 写权限双锁已生效"))
+            findings.append(Finding("PASS", "sandbox", "内置 Read(.env) 与控制面写权限双锁已生效"))
 
     if (home / ".codex").is_dir():
         codex_guard = home / ".codex" / "rules" / "paos-guardrails.rules"
@@ -301,7 +264,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     "WARN",
                     "sandbox",
                     "检测到本机已安装 Codex (~/.codex)，但尚未部署 Starlark 命令门禁规则",
-                    "运行 `paos harden --all` 或 `paos harden --codex` 生成并校验 paos-guardrails.rules",
+                    "运行 `paos harden --all` 生成并校验 paos-guardrails.rules",
                 )
             )
 
@@ -320,7 +283,8 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
         )
     else:
         schema_errors: List[str] = []
-        cmd_paths: List[Path] = []
+        cmd_paths: List[Tuple[Path, bool]] = []
+        has_paos_gate = False
         for event_name, matchers in hooks_cfg.items():
             if not isinstance(matchers, list):
                 schema_errors.append(f"{event_name} 必须是数组")
@@ -333,20 +297,31 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     continue
                 for h in m_obj["hooks"]:
                     if isinstance(h, dict) and h.get("type") == "command" and h.get("command"):
+                        cmd_raw = str(h["command"]).strip()
+                        if "pre_tool_gate" in cmd_raw:
+                            has_paos_gate = True
                         try:
-                            toks = shlex.split(str(h["command"]).strip())
+                            toks = shlex.split(cmd_raw)
                         except ValueError:
-                            toks = str(h["command"]).strip().split()
+                            toks = cmd_raw.split()
                         if not toks:
                             continue
                         first = toks[0]
-                        if os.path.basename(first) in ("python", "python3", "bash", "sh", "zsh", "node"):
+                        base_bin = os.path.basename(first)
+                        if base_bin in ("python", "python3", "bash", "sh", "zsh", "node"):
+                            if any(t in ("-c", "-m", "-e") for t in toks[1:3]):
+                                continue  # Inline script/module invocation — no file path to stat
                             script_args = [t for t in toks[1:] if not t.startswith("-")]
-                            if script_args and not script_args[0].startswith("$"):
-                                cmd_paths.append((_expand_user(script_args[0], home), False))
-                        elif not first.startswith("$"):
-                            if "/" in first or first.startswith("~"):
-                                cmd_paths.append((_expand_user(first, home), True))
+                            if script_args:
+                                exp = _expand_user_path(script_args[0], home)
+                                if not str(exp).startswith("$"):
+                                    cmd_paths.append((exp, False))
+                        else:
+                            exp = _expand_user_path(first, home)
+                            if str(exp).startswith("$"):
+                                continue
+                            if "/" in str(exp):
+                                cmd_paths.append((exp, True))
                             elif not shutil.which(first):
                                 cmd_paths.append((Path(first), True))
 
@@ -369,6 +344,15 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                         "运行 `paos harden` 重新部署并赋权",
                     )
                 )
+            elif not has_paos_gate:
+                findings.append(
+                    Finding(
+                        "WARN",
+                        "hooks",
+                        "PreToolUse 已存在自定义钩子，但尚未挂载 PAOS `pre_tool_gate.py` 词法防呆门禁",
+                        "运行 `paos harden` 非破坏性追加门禁钩子",
+                    )
+                )
             else:
                 findings.append(Finding("PASS", "hooks", "Hooks 三层嵌套 Schema 合法且目标脚本均可执行"))
 
@@ -377,13 +361,13 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                 Finding(
                     "WARN",
                     "hooks",
-                    "检测到用户级全局配置了 Stop 钩子（易在普通问答中误触发或造成重试死循环）",
-                    "建议将 Stop 钩子仅放在具体代码仓 .claude/settings.json 并使用 stop_verify.py 熔断器",
+                    "检测到用户级全局配置了 Stop 钩子（易在普通问答中误触发）",
+                    "建议将 Stop 钩子仅放在具体代码仓 .claude/settings.json 并配合 stop_verify.py 熔断器",
                 )
             )
 
     # =========================================================================
-    # Dimension 4: Secret Leak Surface (Apiiro & PixelLeak Defense)
+    # Dimension 4: Secret Leak Surface Defense
     # =========================================================================
     env = os.environ.copy()
     env["HOME"] = str(home)
@@ -403,18 +387,16 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
 
     global_locked = False
     if global_excl:
-        excl_path = _expand_user(global_excl, home)
-        if excl_path.is_file():
-            content = excl_path.read_text(encoding="utf-8", errors="replace")
-            if "settings.local.json" in content:
-                global_locked = True
+        excl_path = _expand_user_path(global_excl, home)
+        if excl_path.is_file() and "settings.local.json" in excl_path.read_text(encoding="utf-8", errors="replace"):
+            global_locked = True
 
     if not global_locked:
         findings.append(
             Finding(
                 "WARN",
                 "secrets",
-                "全局 gitignore (`core.excludesfile`) 尚未锁死 `.claude/settings.local.json`（防范 2026-11 Apiiro 明文泄密）",
+                "全局 gitignore (`core.excludesfile`) 尚未排除 `.claude/settings.local.json`（防范本地自动批准命令中的凭据误提交 Git）",
                 "运行 `paos harden` 自动写入全局 gitignore",
             )
         )
@@ -446,17 +428,12 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
     # =========================================================================
     # Dimension 5: Learnings Evolution Loop
     # =========================================================================
-    learn_file = ws / "memory" / "learnings.md"
-    if not learn_file.is_file():
-        shared_learn = home / ".paos" / "brain" / "memory" / "learnings.md"
-        if shared_learn.is_file():
-            learn_file = shared_learn
+    shared_learn = home / ".paos" / "brain" / "memory" / "learnings.md"
+    local_learn = ws / "memory" / "learnings.md"
+    learn_file = local_learn if local_learn.is_file() else shared_learn
 
     if learn_file.is_file():
-        counts_tag: Counter[str] = Counter()
-        for line in learn_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not PROMOTED_RE.search(line):
-                counts_tag.update(dict.fromkeys(TAG_RE.findall(line)).keys())
+        counts_tag = scan_unpromoted_tags(learn_file)
         recurring = [f"{t}({c}次)" for t, c in counts_tag.most_common() if c >= 2]
         if recurring:
             findings.append(
@@ -464,13 +441,12 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     "WARN",
                     "evolution",
                     f"learnings.md 中有复发纠偏待晋升：{', '.join(recurring)}",
-                    "运行 `paos promote` 审阅复发坑点并晋升为确定性脚本/钩子，随后加 `[promoted:...]` 归档",
+                    "运行 `paos promote` 审阅复发坑点并晋升为确定性脚本/钩子，随后运行 `paos promote --apply` 归档",
                 )
             )
         else:
             findings.append(Finding("PASS", "evolution", "learnings.md 无积压的重复未晋升纠偏"))
 
-    # Compute 0-100 score
     score = 100
     counts = Counter(f.level for f in findings)
     score -= counts["FAIL"] * 22

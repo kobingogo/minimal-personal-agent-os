@@ -11,13 +11,18 @@ import sys
 from typing import List
 
 from . import __version__
-from .audit import read_audit_events
+from .audit import paos_home, read_audit_events
 from .cron import execute_cron_job_now, install_cron_job, list_cron_jobs, remove_cron_job
 from .doctor import run_doctor
 from .harden import apply_harden, rollback_settings
 from .harnesses import (
     adopt_skills,
+    apply_profile,
+    clean_broken_skills,
     clean_harnesses,
+    enable_skills,
+    list_skills,
+    park_skills,
     resolve_targets,
     restore_links,
     scan_agy_plugins,
@@ -27,18 +32,18 @@ from .harnesses import (
 )
 from .notify import send_notification
 from .scheduler import run_cold_review, run_task
-from .skills import (
-    apply_profile,
-    clean_broken_skills,
-    enable_skills,
-    list_skills,
-    park_skills,
-)
 from .sync_bus import brain_root, init_brain, promote_learnings, sync_brain
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
+
+
+def _default_profiles_file() -> Path:
+    user_pf = paos_home() / ".paos" / "skill-profiles.json"
+    if user_pf.is_file():
+        return user_pf
+    return _repo_root() / "config" / "skill-profiles.json"
 
 
 def _fmt_bytes(num: int) -> str:
@@ -95,7 +100,7 @@ def cmd_matrix(args: argparse.Namespace) -> int:
 
     if t["daisy_chain_symlinks"] > 0:
         print(
-            f"  [WARN] 发现 {t['daisy_chain_symlinks']} 根跨客户端二级软链（如指向 .claude/skills，单端停用即引发连环断链）"
+            f"  [WARN] 发现 {t['daisy_chain_symlinks']} 根跨客户端二级软链（单端停用即引发其他端连环断链）"
         )
         print("         -> 运行 `paos adopt` 收归一级真源 `~/.paos/store/skills/` 彻底根治")
     else:
@@ -117,9 +122,9 @@ def cmd_matrix(args: argparse.Namespace) -> int:
 
 
 def cmd_adopt(args: argparse.Namespace) -> int:
-    targets = resolve_targets(args.targets, Path.home()) if args.targets else None
+    targets = resolve_targets(args.targets, paos_home()) if args.targets else None
     res = adopt_skills(targets=targets, dry_run=args.dry_run)
-    mode = "(--dry-run 预览，未修改文件)" if args.dry_run else "(已完成，快照可随时 `paos restore-links` 回滚)"
+    mode = "(--dry-run 预览，未修改文件)" if args.dry_run else "(已完成，可随时 `paos restore-links` 从基线快照回滚)"
     print(f"=== PAOS Adopt 一级物理真源收归 {mode} ===")
     print(f"  真源目录        : {res['store_dir']}")
     print(f"  收归/索引技能   : {res['adopted_count']} 个")
@@ -146,20 +151,21 @@ def cmd_restore_links(_args: argparse.Namespace) -> int:
 
 
 def cmd_use(args: argparse.Namespace) -> int:
-    pf = Path(args.file) if args.file else (_repo_root() / "config" / "skill-profiles.json")
+    pf = Path(args.file) if args.file else _default_profiles_file()
     if not args.profile:
         cfg = json.loads(pf.read_text(encoding="utf-8"))
-        print("=== PAOS 跨端技能预设档位 (`paos use <profile>`) ===")
+        print(f"=== PAOS 跨端技能预设档位 ({pf}) ===")
         for k, v in (cfg.get("profiles") or {}).items():
             print(f"  * {k:<10} — {v.get('description', '')}")
         return 0
 
-    targets = resolve_targets(args.targets, Path.home()) if args.targets else None
+    targets = resolve_targets(args.targets, paos_home()) if args.targets else None
     res = use_profile(
         args.profile,
         pf,
         targets=targets,
         include_plugins=bool(args.include_plugins),
+        allow_empty=bool(args.allow_empty),
         dry_run=args.dry_run,
     )
     mode = "(--dry-run 预览，未落盘)" if args.dry_run else "(已同步生效，重开对应客户端会话起效)"
@@ -189,11 +195,13 @@ def cmd_use(args: argparse.Namespace) -> int:
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    targets = resolve_targets(args.targets, Path.home()) if args.targets else None
+    targets = resolve_targets(args.targets, paos_home()) if args.targets else None
+    age_sec = 0 if args.all_tmp else 300
     res = clean_harnesses(
         targets=targets,
         heal_links=not args.no_heal,
         prune_claude_state=bool(args.prune_claude_state),
+        min_tmp_age_sec=age_sec,
         dry_run=args.dry_run,
     )
     mode = "(--dry-run 预览，未删除文件)" if args.dry_run else "(清理完成)"
@@ -305,7 +313,7 @@ def cmd_harden(args: argparse.Namespace) -> int:
         return 0
 
     print("=== PAOS Harden 安全加固完成 ===")
-    print(f"  [Claude] 已部署钩子 ({len(res['deployed_hooks'])} 个): ~/.claude/hooks/")
+    print(f"  [Claude] 已部署统一门禁与记忆钩子 ({len(res['deployed_hooks'])} 个): ~/.claude/hooks/")
     if res["backup_path"]:
         print(f"  [Claude] 原配置已备份: {res['backup_path']}")
     print(
@@ -358,15 +366,12 @@ def cmd_skills(args: argparse.Namespace) -> int:
         print(f"\n=== 技能坟场 skills-off ({info['parked_count']} 个，零上下文占用) ===")
         for s in info["parked"][:25]:
             print(f"  - {s['name']}")
-        if info["parked_count"] > 25:
-            print(f"  ... 其余 {info['parked_count'] - 25} 个已隐藏")
         return 0
 
     if sub == "park":
         moved, missing = park_skills(args.names)
         if moved:
             print(f"已移入 ~/.claude/skills-off/ ({len(moved)} 个): {', '.join(moved)}")
-            print("提示：请新开 Claude Code 会话使 /context 瘦身生效。")
         if missing:
             print(f"未在启用目录找到: {', '.join(missing)}", file=sys.stderr)
         return 0 if moved else 1
@@ -375,33 +380,25 @@ def cmd_skills(args: argparse.Namespace) -> int:
         restored, missing = enable_skills(args.names)
         if restored:
             print(f"已恢复启用 ({len(restored)} 个): {', '.join(restored)}")
-            print("提示：请新开 Claude Code 会话加载恢复的 Skill。")
         if missing:
             print(f"未在 skills-off/ 找到: {', '.join(missing)}", file=sys.stderr)
         return 0 if restored else 1
 
     if sub == "clean-broken":
         cleaned = clean_broken_skills()
-        if cleaned:
-            print(f"已清理 {len(cleaned)} 个失效软链接至 skills-off/: {', '.join(cleaned)}")
-        else:
-            print("未发现失效软链接。")
+        print(f"已清理 {len(cleaned)} 个失效软链接。" if cleaned else "未发现失效软链接。")
         return 0
 
     if sub == "profile":
-        pf = Path(args.file) if args.file else (_repo_root() / "config" / "skill-profiles.json")
+        pf = Path(args.file) if args.file else _default_profiles_file()
         if not args.name:
             cfg = json.loads(pf.read_text(encoding="utf-8"))
-            print("=== 可用技能场景预设 (Skill Profiles) ===")
             for k, v in (cfg.get("profiles") or {}).items():
                 print(f"  * {k:10s} — {v.get('description', '')}")
             return 0
         res = apply_profile(args.name, pf, dry_run=args.dry_run)
-        mode = "(预览 --dry-run)" if args.dry_run else "(已生效，新会话起效)"
-        print(f"=== 切换技能预设: {res['profile']} {mode} ===")
-        print(f"  移入 skills-off ({len(res['to_park'])}): {', '.join(res['to_park']) or '无'}")
-        print(f"  恢复启用        ({len(res['to_enable'])}): {', '.join(res['to_enable']) or '无'}")
-        print(f"  最终常驻启用    ({len(res['resulting_active'])}): {', '.join(res['resulting_active']) or '无'}")
+        print(f"=== 切换 Claude 单端预设: {res['profile']} ===")
+        print(f"  常驻启用 ({len(res['resulting_active'])}): {', '.join(res['resulting_active']) or '无'}")
         return 0
 
     return 1
@@ -410,21 +407,21 @@ def cmd_skills(args: argparse.Namespace) -> int:
 def _resolve_memory_dir(explicit_workspace: str | None) -> Path:
     if explicit_workspace:
         return Path(explicit_workspace).resolve() / "memory"
-    shared = brain_root() / "memory"
-    if shared.is_dir():
-        return shared
-    return _repo_root() / "memory"
+    return brain_root() / "memory"
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    seed = Path(args.seed_workspace).resolve() if args.seed_workspace else _repo_root()
-    res = init_brain(seed_workspace=seed)
+    seed = Path(args.seed_workspace).resolve() if args.seed_workspace else None
+    res = init_brain(
+        seed_workspace=seed,
+        repo_profiles_template=_repo_root() / "config" / "skill-profiles.json",
+    )
     print(f"=== PAOS Init 跨端共享大脑已就绪 ({res['brain_dir']}) ===")
     if res["created_files"]:
         for f in res["created_files"]:
             print(f"  + 初始化: {f}")
     else:
-        print("  所有共享记忆与规则文件均已存在，未覆盖任何现有内容。")
+        print("  所有共享记忆与档位配置均已存在，未覆盖任何现有内容。")
     print("  下一步：运行 `paos sync --dry-run` 预览向 Claude / Codex / Antigravity / Cursor 的非破坏性挂载。")
     return 0
 
@@ -449,10 +446,8 @@ def cmd_promote(args: argparse.Namespace) -> int:
         lpath = Path(args.file).resolve()
     elif (Path.cwd() / "memory" / "learnings.md").is_file():
         lpath = Path.cwd() / "memory" / "learnings.md"
-    elif (brain_root() / "memory" / "learnings.md").is_file():
-        lpath = brain_root() / "memory" / "learnings.md"
     else:
-        lpath = _repo_root() / "memory" / "learnings.md"
+        lpath = brain_root() / "memory" / "learnings.md"
 
     res = promote_learnings(lpath, threshold=args.threshold, mark_promoted=args.apply)
     if args.json:
@@ -465,7 +460,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
         return 0
 
     for c in res["candidates"]:
-        print(f"\n  * [tag:{c['tag']}] 复发 {c['count']} 次 -> 建议优先写进 pre_tool_gate.py / 单测守卫，其次写进 CORE_RULES.md:")
+        print(f"\n  * [tag:{c['tag']}] 复发 {c['count']} 次 -> 建议优先写进门禁钩子 / 单测守卫，其次写进 CORE_RULES.md:")
         for entry in c["entries"]:
             print(f"      {entry}")
     if args.apply:
@@ -491,7 +486,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     if args.json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
-        return 0 if res.get("dry_run") else (0 if res["exit_code"] == 0 else res["exit_code"])
+        return 0 if res.get("dry_run") else (0 if res["exit_code"] == 0 else 1)
 
     if res["dry_run"]:
         print("=== PAOS Run 受控调度预览 (--dry-run) ===")
@@ -502,6 +497,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print(f"=== PAOS Run 执行完毕 [{res['status'].upper()}] (耗时 {res['duration_ms'] / 1000:.1f}s) ===")
     print(f"  引擎: {res['engine']} | 退出码: {res['exit_code']} | 脱敏日志: {res['log_path']}")
+    if res.get("base_repo_had_uncommitted"):
+        print("  [提示] 主工作树存在未提交改动，隔离 Worktree 基于最近一次已提交 HEAD 检出。")
     if res.get("worktree_branch"):
         print(f"  隔离分支保留供审查: {res['worktree_branch']} ({res['workdir']})")
     elif res.get("worktree_pruned_clean"):
@@ -533,6 +530,9 @@ def cmd_review(args: argparse.Namespace) -> int:
     if res["status"] == "skipped_empty_diff":
         print(f"=== PAOS Review: {res['summary']} ===")
         return 0
+    if res["status"] == "diff_too_large":
+        print(res["output"], file=sys.stderr)
+        return int(res["exit_code"])
 
     status_labels = {
         "p0_blocked": "BLOCK_P0 (发现阻断级缺陷，退出码 2)",
@@ -662,7 +662,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    ws = Path(args.workspace).resolve() if args.workspace else _repo_root()
+    ws = Path(args.workspace).resolve() if args.workspace else Path.cwd()
     mem = _resolve_memory_dir(args.workspace)
     today_f = mem / "TODAY.md"
     inbox_f = mem / "INBOX.md"
@@ -683,7 +683,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     mat = scan_matrix()
     cron_installed = sum(1 for j in list_cron_jobs() if j["installed"])
     recent_blocks = len(read_audit_events(limit=50, blocks_only=True))
-    brain_ready = "已挂载 ~/.paos/brain" if brain_root().is_dir() else "工作区本地模式 (`paos init` 开启跨端共享)"
+    brain_ready = "已挂载 ~/.paos/brain" if brain_root().is_dir() else "尚未初始化 (`paos init` 开启跨端共享)"
 
     print(f"=== PAOS v{__version__} 个人操作系统仪表盘 ({datetime.now().strftime('%Y-%m-%d')}) ===")
     print(f"安全健康分 : {doc['score']}/100 ({doc['summary']['fail']} 阻断 / {doc['summary']['warn']} 警告 | 近 50 条拦截告警: {recent_blocks} 次)")
@@ -698,7 +698,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         for item in today_items[:5]:
             print(f"  {item}")
     else:
-        print("  (空 — 编辑 TODAY.md 或运行 /triage 生成今日聚焦)")
+        print("  (空 — 编辑 ~/.paos/brain/memory/TODAY.md 或运行 /triage 生成今日聚焦)")
     return 0
 
 
@@ -723,7 +723,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_use.add_argument("profile", nargs="?", help="预设档位名称，留空则列出全部档位")
     p_use.add_argument("--targets", help="逗号分隔的目标客户端（默认全部已安装端：claude,codex,agents,antigravity,cursor）")
     p_use.add_argument("-p", "--include-plugins", action="store_true", help="同步按档位切换 Antigravity 插件包开关")
-    p_use.add_argument("--file", help="自定义 skill-profiles.json 路径")
+    p_use.add_argument("--allow-empty", action="store_true", help="允许将匹配为 0 的档位全部停放至 skills-off/")
+    p_use.add_argument("--file", help="自定义 skill-profiles.json 路径（默认优先读取 ~/.paos/skill-profiles.json）")
     p_use.add_argument("--dry-run", action="store_true", help="仅预览各端 Token 税变化，不落盘")
     p_use.set_defaults(func=cmd_use)
 
@@ -734,12 +735,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_adp.add_argument("--dry-run", action="store_true", help="仅预览收归与治愈动作，不改磁盘")
     p_adp.set_defaults(func=cmd_adopt)
 
-    p_rst = sub.add_parser("restore-links", help="从 ~/.paos/snapshots/ 快照一键回滚 paos adopt 前的软链拓扑")
+    p_rst = sub.add_parser("restore-links", help="从 ~/.paos/snapshots/ 基线快照一键无损还原软链与物理目录拓扑")
     p_rst.set_defaults(func=cmd_restore_links)
 
     p_cln = sub.add_parser("clean", help="安全清理多客户端孤儿 .tmp-* 残留、失效软链及陈旧 .claude.json 项目缓存")
     p_cln.add_argument("--targets", help="逗号分隔的目标客户端（默认全部已安装端）")
     p_cln.add_argument("--no-heal", action="store_true", help="仅隔离失效软链，不尝试从真源自动修复")
+    p_cln.add_argument("--all-tmp", action="store_true", help="立即清理所有 .tmp*（默认仅清理超过 5 分钟的陈旧残留）")
     p_cln.add_argument("--prune-claude-state", action="store_true", help="自动备份并清理 ~/.claude.json 中已删除路径的历史项目缓存")
     p_cln.add_argument("--dry-run", action="store_true", help="仅预览待清理文件与修复项，不落盘")
     p_cln.set_defaults(func=cmd_clean)
@@ -782,8 +784,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_logs.set_defaults(func=cmd_logs)
 
     # Subsystem 3: Unified Memory Bus (`init` / `sync` / `promote` / `capture` / `status`)
-    p_init = sub.add_parser("init", help="初始化 ~/.paos/brain/ 跨客户端共享记忆与核心规则真源")
-    p_init.add_argument("--seed-workspace", help="从现有工作区拷贝初始模板（默认当前 PAOS 仓）")
+    p_init = sub.add_parser("init", help="初始化 ~/.paos/brain/ 跨客户端共享记忆与 ~/.paos/skill-profiles.json")
+    p_init.add_argument("--seed-workspace", help="可选从现有个人工作区迁移初始记忆文件")
     p_init.set_defaults(func=cmd_init)
 
     p_sync = sub.add_parser(
@@ -801,13 +803,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_prm.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     p_prm.set_defaults(func=cmd_promote)
 
-    p_cap = sub.add_parser("capture", help="零 Token 毫秒级把灵感/待办追加进全局或工作区 INBOX.md")
+    p_cap = sub.add_parser("capture", help="零 Token 毫秒级把灵感/待办追加进 ~/.paos/brain/memory/INBOX.md")
     p_cap.add_argument("text", nargs="+", help="要记录的文本或链接")
-    p_cap.add_argument("--workspace", help="指定工作区路径（留空则优先写入 ~/.paos/brain/memory/INBOX.md）")
+    p_cap.add_argument("--workspace", help="可选指定独立工作区路径（默认写入全局 ~/.paos/brain/memory/INBOX.md）")
     p_cap.set_defaults(func=cmd_capture)
 
     p_st = sub.add_parser("status", help="一屏总览安全分、五端累计税、记忆预算、定时巡检与今日 P0")
-    p_st.add_argument("--workspace", help="指定个人 OS 工作区路径")
+    p_st.add_argument("--workspace", help="可选指定工作区路径")
     p_st.set_defaults(func=cmd_status)
 
     # Subsystem 4: Isolated Task Scheduler & Cold-Start Goldfish Reviewer (`run` / `review`)
@@ -820,7 +822,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--sandbox", default="workspace-write", choices=["workspace-write", "read-only"], help="沙盒读写级别")
     p_run.add_argument("--timeout", type=int, default=600, help="硬超时秒数（超时自动 killpg 强杀整棵子进程树，默认 600s）")
     p_run.add_argument("--max-budget-usd", type=float, default=2.0, help="Claude 单次预算上限美元（默认 2.0）")
-    p_run.add_argument("--max-turns", type=int, default=20, help="单次最大轮次上限（默认 20）")
+    p_run.add_argument("--max-turns", type=int, default=20, help="Claude 单次最大轮次上限（默认 20）")
     p_run.add_argument("--model", help="可选指定模型名称")
     p_run.add_argument("--notify", action="store_true", help="任务结束后自动通过通知总线推送结果")
     p_run.add_argument("--dry-run", action="store_true", help="仅预览编译后的底层命令与隔离路径")
@@ -828,11 +830,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(func=cmd_run)
 
     p_rev = sub.add_parser(
-        "review", help="金鱼零上下文冷启动盲审：仅喂 Git Diff，检出 [P0] 阻断级缺陷返回退出码 2"
+        "review", help="金鱼零上下文冷启动盲审：空目录隔离仅喂 Git Diff，检出 [P0] 返回退出码 2"
     )
     p_rev.add_argument("--engine", default="auto", choices=["auto", "codex", "claude", "agy"], help="审查引擎")
-    p_rev.add_argument("--base", help="对比基准分支（如 main；留空则审查当前未提交变更）")
-    p_rev.add_argument("--xhigh", action="store_true", help="启用最高推理强度（适用涉钱/权限/登录/外发消息变更）")
+    p_rev.add_argument("--base", help="对比基准分支（如 main，包含分支提交与工作区未提交/新增文件）")
+    p_rev.add_argument("--xhigh", action="store_true", help="启用高阶深度推理强度（codex=xhigh, agy=xhigh, claude=high）")
     p_rev.add_argument("--timeout", type=int, default=300, help="盲审超时秒数（默认 300s）")
     p_rev.add_argument("--dry-run", action="store_true", help="仅预览盲审命令与 Diff 规模")
     p_rev.add_argument("--json", action="store_true", help="输出机器可读 JSON")
@@ -843,17 +845,17 @@ def build_parser() -> argparse.ArgumentParser:
     cron_sub = p_cron.add_subparsers(dest="cron_cmd", required=True)
     p_c_ls = cron_sub.add_parser("list", help="列出内置与自定义定时任务的安装状态")
     p_c_ls.add_argument("--json", action="store_true")
-    p_c_in = cron_sub.add_parser("install", help="安装定时任务（内置 heartbeat / weekly-hygiene 或自定义任务）")
+    p_c_in = cron_sub.add_parser("install", help="安装定时任务（内置 heartbeat / weekly-hygiene 或带 --cmd 的自定义任务）")
     p_c_in.add_argument("job", help="任务名（如 heartbeat 或 weekly-hygiene）")
     p_c_in.add_argument("--hour", type=int, help="触发小时 (0-23)")
     p_c_in.add_argument("--minute", type=int, help="触发分钟 (0-59)")
     p_c_in.add_argument("--weekday", type=int, help="可选触发星期 (0=周日 .. 6=周六)")
-    p_c_in.add_argument("--cmd", dest="cmd_str", help="可选自定义 Shell 命令")
+    p_c_in.add_argument("--cmd", dest="cmd_str", help="自定义任务的 Shell 命令（不允许覆盖内置任务）")
     p_c_in.add_argument("--dry-run", action="store_true", help="仅预览生成的 launchd plist 或 crontab 条目")
     p_c_rm = cron_sub.add_parser("remove", help="卸载指定定时任务")
     p_c_rm.add_argument("job", help="任务名")
     p_c_rm.add_argument("--dry-run", action="store_true")
-    p_c_rn = cron_sub.add_parser("run-now", help="在原子锁保护下立即单次触发指定定时任务")
+    p_c_rn = cron_sub.add_parser("run-now", help="在内核 flock 排他锁保护下立即单次触发指定定时任务")
     p_c_rn.add_argument("job", help="任务名")
     p_c_rn.add_argument("--no-notify", action="store_true", help="本次执行不发送完成通知")
     p_c_rn.add_argument("--dry-run", action="store_true")
@@ -864,25 +866,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ntf.add_argument("title", help="通知标题")
     p_ntf.add_argument("message", nargs="+", help="通知正文（自动执行出站密钥脱敏）")
-    p_ntf.add_argument("--channel", default="auto", help="通道：auto / macos / feishu / telegram / webhook")
+    p_ntf.add_argument("--channel", default="auto", help="通道：auto / macos / feishu / telegram / webhook / stdout")
     p_ntf.add_argument("--dry-run", action="store_true", help="仅预览脱敏后的出站消息载荷")
     p_ntf.add_argument("--json", action="store_true")
     p_ntf.set_defaults(func=cmd_notify)
 
-    # Legacy single-harness Claude skill subcommands (100% preserved for compatibility)
-    p_sk = sub.add_parser("skills", help="单端管理 ~/.claude/skills 与 skills-off/ 坟场")
+    # Single-harness compatibility alias (`paos skills` -> prefer `paos use` for multi-harness)
+    p_sk = sub.add_parser("skills", help="兼容旧版：仅管理 Claude 单端 ~/.claude/skills（多端切档请优先用 `paos use`）")
     sk_sub = p_sk.add_subparsers(dest="skills_cmd", required=True)
-    p_sk_ls = sk_sub.add_parser("list", help="列出启用与停放的 Skill 及预估 Token 开销")
+    p_sk_ls = sk_sub.add_parser("list")
     p_sk_ls.add_argument("--json", action="store_true")
-    p_sk_park = sk_sub.add_parser("park", help="将低频 Skill 移入 ~/.claude/skills-off/ 释放上下文")
-    p_sk_park.add_argument("names", nargs="+", help="要停放的 Skill 名称")
-    p_sk_en = sk_sub.add_parser("enable", help="从 ~/.claude/skills-off/ 恢复启用指定 Skill")
-    p_sk_en.add_argument("names", nargs="+", help="要恢复的 Skill 名称")
-    sk_sub.add_parser("clean-broken", help="将失效软链接移入 skills-off/")
-    p_sk_prof = sk_sub.add_parser("profile", help="按工作场景切换 Claude 单端常驻 Skill 集合")
-    p_sk_prof.add_argument("name", nargs="?", help="预设名称（如 minimal / writing / coding），留空则列出全部")
-    p_sk_prof.add_argument("--file", help="自定义 skill-profiles.json 路径")
-    p_sk_prof.add_argument("--dry-run", action="store_true", help="仅预览变更")
+    p_sk_park = sk_sub.add_parser("park")
+    p_sk_park.add_argument("names", nargs="+")
+    p_sk_en = sk_sub.add_parser("enable")
+    p_sk_en.add_argument("names", nargs="+")
+    sk_sub.add_parser("clean-broken")
+    p_sk_prof = sk_sub.add_parser("profile")
+    p_sk_prof.add_argument("name", nargs="?")
+    p_sk_prof.add_argument("--file")
+    p_sk_prof.add_argument("--dry-run", action="store_true")
     p_sk.set_defaults(func=cmd_skills)
 
     return p
@@ -891,4 +893,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: List[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
+        msg = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+        print(f"[PAOS 错误] {msg}", file=sys.stderr)
+        return 1

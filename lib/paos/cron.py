@@ -1,30 +1,29 @@
-"""Zero-daemon native OS scheduler (`launchd` plist on macOS / `crontab` on Linux) for PAOS."""
+"""Zero-daemon native OS scheduler (`launchd` plist on macOS / `crontab` on Linux) with `fcntl.flock`."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
 import platform
 import plistlib
-import pwd
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
-from .audit import append_audit_event, redact_secrets
+from .audit import append_audit_event, paos_home, real_user_home, redact_secrets, redact_truncate
 from .doctor import run_doctor
 from .harnesses import clean_harnesses, scan_matrix
 from .notify import send_notification
-from .scheduler import _exec_with_pgroup_timeout, run_task
+from .scheduler import exec_with_pgroup_timeout, run_task
 
 JOB_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
-STALE_LOCK_MAX_AGE_SEC = 7200  # 2 hours fallback if lock has no pid file
 
 BUILTIN_JOBS: Dict[str, Dict[str, Any]] = {
     "heartbeat": {
@@ -57,19 +56,41 @@ def _validate_schedule(hour: int, minute: int, weekday: Optional[int]) -> None:
         raise ValueError(f"weekday 必须在 0..6 (0=周日) 之间，收到: {weekday}")
 
 
+def _default_cron_path(home: Path) -> str:
+    parts = [
+        str(home / ".local/bin"),
+        str(home / ".bun/bin"),
+        str(home / ".volta/bin"),
+        str(home / ".cargo/bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+    return ":".join(parts)
+
+
 def _jobs_registry_path(home: Path) -> Path:
     return home / ".paos" / "cron_jobs.json"
 
 
 def _load_jobs_registry(home: Path) -> Dict[str, Dict[str, Any]]:
     p = _jobs_registry_path(home)
-    data = dict(BUILTIN_JOBS)
+    data = {k: dict(v) for k, v in BUILTIN_JOBS.items()}
     if p.is_file():
         try:
             custom = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(custom, dict):
                 for k, v in custom.items():
-                    data[k] = v
+                    if not isinstance(v, dict):
+                        continue
+                    if k in BUILTIN_JOBS:
+                        # Security boundary: NEVER allow `cron_jobs.json` to inject arbitrary `cmd` into builtin jobs!
+                        for sched_k in ("hour", "minute", "weekday"):
+                            if sched_k in v:
+                                data[k][sched_k] = v[sched_k]
+                    else:
+                        data[k] = v
         except Exception:
             pass
     return data
@@ -86,6 +107,20 @@ def _save_custom_job(home: Path, name: str, spec: Dict[str, Any]) -> None:
             current = {}
     current[name] = spec
     p.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(p, 0o600)
+
+
+def _delete_custom_job_entry(home: Path, name: str) -> None:
+    p = _jobs_registry_path(home)
+    if not p.is_file():
+        return
+    try:
+        current = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(current, dict) and name in current:
+            del current[name]
+            p.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def plist_path_for(job_name: str, home: Path) -> Path:
@@ -117,7 +152,7 @@ def build_launchd_plist(
         "StandardOutPath": str(logs_dir / f"{safe_name}.out.log"),
         "StandardErrorPath": str(logs_dir / f"{safe_name}.err.log"),
         "EnvironmentVariables": {
-            "PATH": f"{home / '.local/bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            "PATH": _default_cron_path(home),
             "HOME": str(home),
         },
     }
@@ -138,15 +173,28 @@ def build_crontab_line(
     hour: int,
     minute: int,
     weekday: Optional[int] = None,
+    home: Optional[Path] = None,
 ) -> str:
     safe_name = _validate_job_name(job_name)
     _validate_schedule(hour, minute, weekday)
     dow = str(weekday) if weekday is not None else "*"
-    cmd = f"{shlex.quote(sys.executable)} -B {shlex.quote(str(paos_bin))} cron run-now {shlex.quote(safe_name)}"
+    env_prefix = f"PATH={_default_cron_path(home)} " if home else ""
+    cmd = f"{env_prefix}{shlex.quote(sys.executable)} -B {shlex.quote(str(paos_bin))} cron run-now {shlex.quote(safe_name)}"
     return f"{int(minute)} {int(hour)} * * {dow} {cmd} {_crontab_tag(safe_name)}"
 
 
-def _read_crontab_lines_safe() -> List[str]:
+def _should_touch_live_os_scheduler(home: Path, register_flag: bool) -> bool:
+    if not register_flag:
+        return False
+    if os.environ.get("PAOS_SKIP_LAUNCHCTL") == "1" or os.environ.get("PAOS_SKIP_OS_SCHEDULER") == "1":
+        return False
+    return home == real_user_home()
+
+
+def _read_crontab_lines(home: Path, live_os: bool) -> List[str]:
+    if not live_os:
+        mock_f = home / ".paos" / "crontab.mock"
+        return mock_f.read_text(encoding="utf-8").splitlines() if mock_f.is_file() else []
     r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5)
     if r.returncode == 0:
         return r.stdout.splitlines()
@@ -155,15 +203,26 @@ def _read_crontab_lines_safe() -> List[str]:
     raise RuntimeError(f"读取系统 crontab 失败，拒绝覆盖修改: {r.stderr.strip()}")
 
 
-def list_cron_jobs(home_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-    home = (home_dir or Path.home()).resolve()
+def _write_crontab_lines(home: Path, lines: List[str], live_os: bool) -> None:
+    body = ("\n".join(lines) + "\n") if lines else ""
+    if not live_os:
+        mock_f = home / ".paos" / "crontab.mock"
+        mock_f.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        mock_f.write_text(body, encoding="utf-8")
+        return
+    subprocess.run(["crontab", "-"], input=body, text=True, check=True, capture_output=True)
+
+
+def list_cron_jobs(home_dir: Optional[Path] = None, register_launchctl: bool = True) -> List[Dict[str, Any]]:
+    home = paos_home(home_dir)
     reg = _load_jobs_registry(home)
     is_mac = platform.system() == "Darwin"
+    live_os = _should_touch_live_os_scheduler(home, register_launchctl)
 
     crontab_lines: List[str] = []
     if not is_mac:
         try:
-            crontab_lines = _read_crontab_lines_safe()
+            crontab_lines = _read_crontab_lines(home, live_os=live_os)
         except Exception:
             crontab_lines = []
 
@@ -206,16 +265,21 @@ def install_cron_job(
     register_launchctl: bool = True,
 ) -> Dict[str, Any]:
     _validate_job_name(job_name)
-    home = (home_dir or Path.home()).resolve()
+    home = paos_home(home_dir)
     reg = _load_jobs_registry(home)
-    base = reg.get(job_name, {"description": custom_cmd or f"Custom PAOS job {job_name}", "hour": 9, "minute": 0, "weekday": None})
 
+    if job_name in BUILTIN_JOBS and custom_cmd:
+        raise ValueError(f"安全限制：不允许为内置任务 '{job_name}' 覆盖自定义 Shell 命令，请使用独立任务名。")
+    if job_name not in reg and not custom_cmd:
+        raise ValueError(f"新建自定义定时任务 '{job_name}' 必须通过 `--cmd` 指定要执行的命令。")
+
+    base = reg.get(job_name, {"description": f"Custom job {job_name}", "hour": 9, "minute": 0, "weekday": None})
     h = int(hour if hour is not None else base.get("hour", 9))
     m = int(minute if minute is not None else base.get("minute", 0))
     wd = weekday if weekday is not None else base.get("weekday")
     _validate_schedule(h, m, wd)
 
-    spec = {
+    spec: Dict[str, Any] = {
         "description": base.get("description", ""),
         "hour": h,
         "minute": m,
@@ -227,13 +291,13 @@ def install_cron_job(
 
     if not dry_run and (
         job_name not in BUILTIN_JOBS
-        or custom_cmd
         or hour is not None
         or minute is not None
         or weekday is not None
     ):
         _save_custom_job(home, job_name, spec)
 
+    live_os = _should_touch_live_os_scheduler(home, register_launchctl)
     if platform.system() == "Darwin":
         pp = plist_path_for(job_name, home)
         plist_bytes = build_launchd_plist(job_name, paos_bin, home, h, m, wd)
@@ -241,8 +305,7 @@ def install_cron_job(
             (home / ".paos" / "logs" / "cron").mkdir(parents=True, mode=0o700, exist_ok=True)
             pp.parent.mkdir(parents=True, exist_ok=True)
             pp.write_bytes(plist_bytes)
-            real_pw_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
-            if register_launchctl and home == real_pw_home and os.environ.get("PAOS_SKIP_LAUNCHCTL") != "1":
+            if live_os:
                 uid = os.getuid()
                 subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(pp)], capture_output=True)
                 subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(pp)], capture_output=True)
@@ -254,11 +317,11 @@ def install_cron_job(
             "preview": plist_bytes.decode("utf-8"),
         }
 
-    line = build_crontab_line(job_name, paos_bin, h, m, wd)
+    line = build_crontab_line(job_name, paos_bin, h, m, wd, home=home)
     if not dry_run:
-        existing = [l for l in _read_crontab_lines_safe() if not _line_has_cron_tag(l, job_name)]
+        existing = [l for l in _read_crontab_lines(home, live_os=live_os) if not _line_has_cron_tag(l, job_name)]
         existing.append(line)
-        subprocess.run(["crontab", "-"], input="\n".join(existing) + "\n", text=True, check=True, capture_output=True)
+        _write_crontab_lines(home, existing, live_os=live_os)
     return {
         "dry_run": dry_run,
         "platform": "linux",
@@ -275,61 +338,55 @@ def remove_cron_job(
     register_launchctl: bool = True,
 ) -> Dict[str, Any]:
     _validate_job_name(job_name)
-    home = (home_dir or Path.home()).resolve()
+    home = paos_home(home_dir)
+    live_os = _should_touch_live_os_scheduler(home, register_launchctl)
+
     if platform.system() == "Darwin":
         pp = plist_path_for(job_name, home)
         existed = pp.is_file()
-        if existed and not dry_run:
-            real_pw_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
-            if register_launchctl and home == real_pw_home and os.environ.get("PAOS_SKIP_LAUNCHCTL") != "1":
-                uid = os.getuid()
-                subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(pp)], capture_output=True)
-            pp.unlink()
+        if not dry_run:
+            if existed:
+                if live_os:
+                    uid = os.getuid()
+                    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(pp)], capture_output=True)
+                pp.unlink()
+            _delete_custom_job_entry(home, job_name)
         return {"dry_run": dry_run, "job": job_name, "removed": existed, "path": str(pp)}
 
-    lines = _read_crontab_lines_safe()
+    lines = _read_crontab_lines(home, live_os=live_os)
     filtered = [l for l in lines if not _line_has_cron_tag(l, job_name)]
     removed = len(filtered) != len(lines)
-    if removed and not dry_run:
-        subprocess.run(
-            ["crontab", "-"],
-            input=("\n".join(filtered) + "\n") if filtered else "",
-            text=True,
-            check=True,
-            capture_output=True,
-        )
+    if not dry_run:
+        if removed:
+            _write_crontab_lines(home, filtered, live_os=live_os)
+        _delete_custom_job_entry(home, job_name)
     return {"dry_run": dry_run, "job": job_name, "removed": removed, "path": "crontab"}
 
 
-def _acquire_job_lock(lock_dir: Path) -> bool:
-    lock_dir.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    for _ in range(2):
+def lock_file_for_job(job_name: str, home: Path) -> Path:
+    return home / ".paos" / "locks" / f"{_validate_job_name(job_name)}.flock"
+
+
+@contextmanager
+def acquire_job_flock(lock_file: Path) -> Iterator[bool]:
+    """Kernel-managed `fcntl.flock` — auto-released by OS on crash/SIGKILL/reboot, zero PID reuse races."""
+    lock_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
+    try:
         try:
-            lock_dir.mkdir(mode=0o700)
-            (lock_dir / "pid").write_text(str(os.getpid()), encoding="utf-8")
-            return True
-        except FileExistsError:
-            pid_file = lock_dir / "pid"
-            stale = False
-            if pid_file.is_file():
-                try:
-                    owner_pid = int(pid_file.read_text(encoding="utf-8").strip())
-                    os.kill(owner_pid, 0)
-                except ProcessLookupError:
-                    stale = True
-                except (ValueError, PermissionError, OSError):
-                    stale = False
-            else:
-                try:
-                    if time.time() - lock_dir.stat().st_mtime > STALE_LOCK_MAX_AGE_SEC:
-                        stale = True
-                except OSError:
-                    stale = False
-            if stale:
-                shutil.rmtree(lock_dir, ignore_errors=True)
-                continue
-            return False
-    return False
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def execute_cron_job_now(
@@ -339,22 +396,22 @@ def execute_cron_job_now(
     notify: bool = True,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Run a scheduled job under a private `~/.paos/locks` PID-checked atomic lock."""
+    """Run a scheduled job under an OS kernel `fcntl.flock` non-blocking lock."""
     _validate_job_name(job_name)
-    home = (home_dir or Path.home()).resolve()
+    home = paos_home(home_dir)
     reg = _load_jobs_registry(home)
     if job_name not in reg:
         raise KeyError(f"未知定时任务 '{job_name}'，可选：{', '.join(sorted(reg.keys()))}")
 
-    lock_dir = home / ".paos" / "locks" / f"{job_name}.lock"
+    lock_path = lock_file_for_job(job_name, home)
     if dry_run:
-        return {"dry_run": True, "job": job_name, "lock_dir": str(lock_dir), "spec": reg[job_name]}
+        return {"dry_run": True, "job": job_name, "lock_file": str(lock_path), "spec": reg[job_name]}
 
-    if not _acquire_job_lock(lock_dir):
-        return {"dry_run": False, "job": job_name, "status": "skipped_locked", "summary": "同名定时任务正在运行，跳过重叠触发"}
+    with acquire_job_flock(lock_path) as got_lock:
+        if not got_lock:
+            return {"dry_run": False, "job": job_name, "status": "skipped_locked", "summary": "同名定时任务正在运行，跳过重叠触发"}
 
-    t0 = time.monotonic()
-    try:
+        t0 = time.monotonic()
         spec = reg[job_name]
         if job_name == "weekly-hygiene":
             cln = clean_harnesses(home_dir=home, min_tmp_age_sec=300, dry_run=False)
@@ -366,8 +423,8 @@ def execute_cron_job_now(
                 f"五端常驻税: ~{mat['totals']['estimated_tokens_across_harnesses']:,} tok"
             )
             status = "ok"
-        elif spec.get("cmd"):
-            rc, out, err, timed_out = _exec_with_pgroup_timeout(
+        elif job_name not in BUILTIN_JOBS and spec.get("cmd"):
+            rc, out, err, timed_out = exec_with_pgroup_timeout(
                 ["/bin/sh", "-c", str(spec["cmd"])],
                 cwd=home,
                 timeout_sec=300,
@@ -375,13 +432,13 @@ def execute_cron_job_now(
             status = "timeout" if timed_out else ("ok" if rc == 0 else "failed")
             summary = redact_secrets((out + "\n" + err).strip())[-400:] or f"exit={rc}"
         else:
-            hb_file = repo_dir / "HEARTBEAT.md"
+            hb_file = home / ".paos" / "brain" / "HEARTBEAT.md"
+            if not hb_file.is_file():
+                hb_file = repo_dir / "templates" / "brain" / "HEARTBEAT.md"
             inbox_path = home / ".paos" / "brain" / "memory" / "INBOX.md"
-            if not inbox_path.parent.is_dir():
-                inbox_path = repo_dir / "memory" / "INBOX.md"
             res = run_task(
-                prompt=f"只读阅读 {hb_file}，生成最多 3 条简短巡检提醒（每行 `- ` 开头），不要修改任何代码文件。",
-                workdir=repo_dir,
+                prompt=f"只读阅读 {hb_file} 与 {inbox_path.parent}，输出最多 3 条简短巡检提醒（每行必须以 `- ` 开头），不要修改任何文件。",
+                workdir=home / ".paos" / "brain" if (home / ".paos" / "brain").is_dir() else repo_dir,
                 sandbox_mode="read-only",
                 max_budget_usd=1.0,
                 max_turns=10,
@@ -392,22 +449,22 @@ def execute_cron_job_now(
             summary = res["stdout_tail"][:350] or status
             if status == "ok" and res["stdout_tail"].strip():
                 bullets = [
-                    l.strip().lstrip("-* ").strip()
+                    l.strip()[2:].strip()
                     for l in res["stdout_tail"].splitlines()
-                    if l.strip()
+                    if re.match(r"^\s*[-*]\s+\S", l)
                 ][:3]
                 if bullets:
                     inbox_path.parent.mkdir(parents=True, exist_ok=True)
                     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
                     with inbox_path.open("a", encoding="utf-8") as f:
                         for b in bullets:
-                            f.write(f"- [{stamp}] [Heartbeat] {b[:180]}\n")
+                            f.write(f"- [{stamp}] [Heartbeat] {redact_truncate(b, 180)}\n")
 
         dur_ms = int((time.monotonic() - t0) * 1000)
         append_audit_event(
             event_type="cron_job",
             status=status,
-            summary=f"[{job_name}] {summary[:160]}",
+            summary=f"[{job_name}] {redact_truncate(summary, 160)}",
             duration_ms=dur_ms,
             home_dir=home,
         )
@@ -418,5 +475,3 @@ def execute_cron_job_now(
                 home_dir=home,
             )
         return {"dry_run": False, "job": job_name, "status": status, "duration_ms": dur_ms, "summary": summary}
-    finally:
-        shutil.rmtree(lock_dir, ignore_errors=True)

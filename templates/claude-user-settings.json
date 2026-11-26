@@ -8,12 +8,24 @@
         "~/.ssh/**",
         "~/.aws/**",
         "~/.config/gh/**",
+        "~/.paos/config.json",
         "**/.env*"
       ],
       "denyWrite": [
         "~/.claude/**",
         "~/.codex/rules/**",
-        "~/.paos/logs/**"
+        "~/.paos/config.json",
+        "~/.paos/cron_jobs.json",
+        "~/.paos/logs/**",
+        "~/.paos/store/**",
+        "~/.paos/brain/CORE_RULES.md",
+        "~/.ssh/**",
+        "~/.aws/**",
+        "~/.config/gh/**",
+        "~/Library/LaunchAgents/**",
+        "**/.claude/settings*.json",
+        "**/.claude/hooks/**",
+        "**/.git/hooks/**"
       ]
     },
     "network": {
@@ -41,8 +53,26 @@
       "Edit(~/.claude/**)",
       "Write(~/.codex/rules/**)",
       "Edit(~/.codex/rules/**)",
+      "Write(~/.paos/config.json)",
+      "Edit(~/.paos/config.json)",
+      "Write(~/.paos/cron_jobs.json)",
+      "Edit(~/.paos/cron_jobs.json)",
       "Write(~/.paos/logs/**)",
-      "Edit(~/.paos/logs/**)"
+      "Edit(~/.paos/logs/**)",
+      "Write(~/.paos/store/**)",
+      "Edit(~/.paos/store/**)",
+      "Write(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Write(~/.aws/**)",
+      "Edit(~/.aws/**)",
+      "Write(~/Library/LaunchAgents/**)",
+      "Edit(~/Library/LaunchAgents/**)",
+      "Write(**/.claude/settings*.json)",
+      "Edit(**/.claude/settings*.json)",
+      "Write(**/.claude/hooks/**)",
+      "Edit(**/.claude/hooks/**)",
+      "Write(**/.git/hooks/**)",
+      "Edit(**/.git/hooks/**)"
     ]
   },
   "hooks": {

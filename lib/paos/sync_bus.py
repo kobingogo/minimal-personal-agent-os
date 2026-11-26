@@ -1,8 +1,7 @@
 """Unified Cross-Harness Memory & Rule Compiler (`~/.paos/brain/` -> Claude/Codex/Antigravity/Cursor).
 
 Uses non-destructive `<!-- PAOS:BEGIN --> ... <!-- PAOS:END -->` managed blocks so user-authored
-instructions (e.g. `~/.codex/AGENTS.md` `@RTK.md` or `~/.gemini/GEMINI.md` personal rules) are
-preserved 100% intact, even when rules contain regex/backslash escapes.
+instructions are preserved 100% intact, with automatic first-touch backups.
 """
 
 from __future__ import annotations
@@ -10,10 +9,14 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 import difflib
+import json
+import os
 from pathlib import Path
 import re
 import shutil
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from .audit import paos_home
 
 BEGIN_MARKER = "<!-- PAOS:BEGIN -->"
 END_MARKER = "<!-- PAOS:END -->"
@@ -21,7 +24,8 @@ MANAGED_BLOCK_RE = re.compile(
     re.escape(BEGIN_MARKER) + r".*?" + re.escape(END_MARKER) + r"\n?",
     re.S,
 )
-TAG_RE = re.compile(r"\[tag:([a-zA-Z0-9_-]+)\]")
+# Supports ASCII slugs and CJK/Unicode tags like `[tag:cache-bust]` or `[tag:缓存穿透]`
+TAG_RE = re.compile(r"\[tag:([^\s\[\]]+)\]")
 PROMOTED_RE = re.compile(r"\[promoted:")
 ALLOWED_SYNC_TARGETS = ("claude", "codex", "antigravity", "cursor")
 
@@ -32,20 +36,44 @@ DEFAULT_CORE_RULES = """# PAOS 跨端共享核心工程契约 (CORE_RULES)
 """
 
 DEFAULT_SHARED_USER = """# 个人季度主线与边界 (USER)
-- 主线 1：聚焦核心产品与自动化工程交付，砍掉偏离主线的玩具需求。
-- 主线 2：沉淀高复用确定性脚本与开源资产（钩子与脚本优先于纯文字叮嘱）。
-- 禁区边界：个人财务、主账号根私钥与未脱敏凭证严禁混入编码工作区。
+- 主线 1：聚焦核心产品与自动化工程交付，砍掉偏离主线的低优需求。
+- 主线 2：沉淀高复用确定性脚本与工程护栏（钩子与单测优先于纯文字叮嘱）。
+- 禁区边界：个人财务、主账号根私钥与未脱敏生产凭证严禁混入编码工作区。
+"""
+
+DEFAULT_HEARTBEAT = """# HEARTBEAT.md（每日晨间只读巡检清单）
+- 检查 `~/.paos/brain/memory/INBOX.md` 与 `learnings.md` 中积压的未处理事项。
+- 提炼最多 3 条今日最值得优先收敛的技术债、复发坑点或待分诊事项（每行必须以 `- ` 开头）。
+- 严禁修改任何代码、规则或配置文件。
 """
 
 
 def brain_root(home_dir: Optional[Path] = None) -> Path:
-    home = (home_dir or Path.home()).resolve()
-    return home / ".paos" / "brain"
+    return paos_home(home_dir) / ".paos" / "brain"
 
 
-def init_brain(home_dir: Optional[Path] = None, seed_workspace: Optional[Path] = None) -> Dict[str, Any]:
-    """Initialize `~/.paos/brain/` shared state directory idempotently."""
-    home = (home_dir or Path.home()).resolve()
+def scan_unpromoted_tags(learnings_path: Path) -> Counter[str]:
+    """Count recurring `[tag:...]` occurrences across unpromoted lines (deduplicated per line)."""
+    counts: Counter[str] = Counter()
+    if not learnings_path.is_file():
+        return counts
+    try:
+        lines = learnings_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return counts
+    for line in lines:
+        if not PROMOTED_RE.search(line):
+            counts.update(dict.fromkeys(TAG_RE.findall(line)).keys())
+    return counts
+
+
+def init_brain(
+    home_dir: Optional[Path] = None,
+    seed_workspace: Optional[Path] = None,
+    repo_profiles_template: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Initialize `~/.paos/brain/` shared state & user `~/.paos/skill-profiles.json` idempotently."""
+    home = paos_home(home_dir)
     broot = brain_root(home)
     mem = broot / "memory"
     (mem / "daily").mkdir(parents=True, exist_ok=True)
@@ -62,9 +90,14 @@ def init_brain(home_dir: Optional[Path] = None, seed_workspace: Optional[Path] =
             dst.write_text(fallback_content, encoding="utf-8")
         created.append(str(dst))
 
-    _ensure_file(broot / "CORE_RULES.md", DEFAULT_CORE_RULES)
+    _ensure_file(broot / "CORE_RULES.md", DEFAULT_CORE_RULES, "CORE_RULES.md")
     _ensure_file(broot / "USER.md", DEFAULT_SHARED_USER, "USER.md")
-    _ensure_file(mem / "TODAY.md", "# 今日聚焦 (最多 3 件 P0)\n\n- [ ] 运行 `paos status` 查看五端状态\n", "memory/TODAY.md")
+    _ensure_file(broot / "HEARTBEAT.md", DEFAULT_HEARTBEAT, "HEARTBEAT.md")
+    _ensure_file(
+        mem / "TODAY.md",
+        "# 今日聚焦 (最多 3 件 P0)\n\n- [ ] 运行 `paos status` 查看五端状态与上下文税\n",
+        "memory/TODAY.md",
+    )
     _ensure_file(mem / "INBOX.md", "# 全局待分诊收件箱 (INBOX)\n\n", "memory/INBOX.md")
     _ensure_file(
         mem / "MEMORY.md",
@@ -73,9 +106,14 @@ def init_brain(home_dir: Optional[Path] = None, seed_workspace: Optional[Path] =
     )
     _ensure_file(
         mem / "learnings.md",
-        "# 待审校纠偏草稿箱 (Learnings)\n\n<!-- 格式: - [YYYY-MM-DD] [tag:类别] 现象 -> 根因 -> 防复发动作 -->\n",
+        "# 待审校纠偏草稿箱 (Learnings)\n\n<!-- 格式: - [YYYY-MM-DD] [tag:slug] 现象 -> 根因 -> 防复发动作 -->\n",
         "memory/learnings.md",
     )
+
+    user_profiles = home / ".paos" / "skill-profiles.json"
+    if not user_profiles.is_file() and repo_profiles_template and repo_profiles_template.is_file():
+        shutil.copy2(repo_profiles_template, user_profiles)
+        created.append(str(user_profiles))
 
     return {"brain_dir": str(broot), "created_files": created}
 
@@ -91,20 +129,19 @@ def _extract_active_summary(broot: Path) -> Dict[str, str]:
             if l.strip().startswith("- [ ]")
         ][:3]
 
-    learn_p = broot / "memory" / "learnings.md"
-    hot_tags: List[str] = []
-    if learn_p.is_file():
-        counts: Counter[str] = Counter()
-        for line in learn_p.read_text(encoding="utf-8").splitlines():
-            if not PROMOTED_RE.search(line):
-                counts.update(dict.fromkeys(TAG_RE.findall(line)).keys())
-        hot_tags = [f"{t}({c}次)" for t, c in counts.most_common(3) if c >= 2]
+    counts = scan_unpromoted_tags(broot / "memory" / "learnings.md")
+    hot_tags = [f"{t}({c}次)" for t, c in counts.most_common(3) if c >= 2]
 
     return {
         "core_rules": core_txt,
         "today_summary": "\n".join(today_lines) if today_lines else "- (暂无未完成 P0，可通过 `paos capture` 或编辑 `~/.paos/brain/memory/TODAY.md` 设定)",
         "hot_tags": ", ".join(hot_tags),
     }
+
+
+def _sanitize_block_inner(block_inner: str) -> str:
+    """Prevent accidental marker strings inside user notes from breaking `MANAGED_BLOCK_RE`."""
+    return block_inner.replace(BEGIN_MARKER, "<!-- PAOS_BEGIN -->").replace(END_MARKER, "<!-- PAOS_END -->")
 
 
 def _upsert_managed_block(existing: str, block_inner: str, remove: bool = False) -> str:
@@ -114,15 +151,21 @@ def _upsert_managed_block(existing: str, block_inner: str, remove: bool = False)
         cleaned = MANAGED_BLOCK_RE.sub("", existing).rstrip()
         return (cleaned + "\n") if cleaned else ""
 
-    wrapped = f"{BEGIN_MARKER}\n{block_inner.rstrip()}\n{END_MARKER}\n"
+    safe_inner = _sanitize_block_inner(block_inner).rstrip()
+    wrapped = f"{BEGIN_MARKER}\n{safe_inner}\n{END_MARKER}\n"
     if MANAGED_BLOCK_RE.search(existing):
-        # Lambda avoids Python `re.sub` parsing `\d`, `\s`, `\u`, `\1` escapes inside user rule text!
         return MANAGED_BLOCK_RE.sub(lambda _m: wrapped, existing, count=1)
 
     base = existing.rstrip()
     if not base:
         return wrapped
     return f"{base}\n\n{wrapped}"
+
+
+def _write_preserving_symlink(dst_path: Path, content: str) -> None:
+    target = dst_path.resolve() if dst_path.is_symlink() else dst_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
 
 
 def sync_brain(
@@ -132,7 +175,7 @@ def sync_brain(
     remove: bool = False,
 ) -> Dict[str, Any]:
     """Compile `~/.paos/brain/` into Claude, Codex, Antigravity, and Cursor non-destructively."""
-    home = (home_dir or Path.home()).resolve()
+    home = paos_home(home_dir)
     broot = brain_root(home)
     if not remove and not broot.is_dir():
         if not dry_run:
@@ -186,6 +229,15 @@ def sync_brain(
                 f"- 今日全局 P0 (`~/.paos/brain/memory/TODAY.md`)：\n{summary['today_summary']}{hot_line}"
             ),
         ),
+        "cursor": (
+            home / ".cursor" / "rules" / "paos-shared.mdc",
+            (
+                f"{summary['core_rules']}\n\n"
+                "## PAOS Shared Pointers\n"
+                "- User Goals: `~/.paos/brain/USER.md` | Memory Index: `~/.paos/brain/memory/MEMORY.md` | Learnings: `~/.paos/brain/memory/learnings.md`\n"
+                f"- Today Focus (`TODAY.md`):\n{summary['today_summary']}{hot_line}"
+            ),
+        ),
     }
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -193,45 +245,23 @@ def sync_brain(
     file_results: List[Dict[str, Any]] = []
 
     for hid in chosen:
-        if hid == "cursor":
-            mdc_path = home / ".cursor" / "rules" / "paos-shared.mdc"
-            old_txt = mdc_path.read_text(encoding="utf-8") if mdc_path.is_file() else ""
-            if remove:
-                new_txt = ""
-            else:
-                new_txt = (
-                    "---\n"
-                    "description: PAOS Cross-Harness Shared Core Rules & Memory Pointers\n"
-                    "alwaysApply: true\n"
-                    "---\n\n"
-                    f"{summary['core_rules']}\n\n"
-                    f"Shared Memory Index: `~/.paos/brain/memory/MEMORY.md` | Learnings: `~/.paos/brain/memory/learnings.md`\n"
-                )
-            diff = "".join(
-                difflib.unified_diff(
-                    old_txt.splitlines(keepends=True),
-                    new_txt.splitlines(keepends=True),
-                    fromfile=str(mdc_path) + " (before)",
-                    tofile=str(mdc_path) + " (after)",
-                )
-            )
-            changed = old_txt != new_txt
-            if changed and not dry_run:
-                if remove and mdc_path.is_file():
-                    mdc_path.unlink()
-                elif not remove:
-                    mdc_path.parent.mkdir(parents=True, exist_ok=True)
-                    mdc_path.write_text(new_txt, encoding="utf-8")
-            file_results.append({"target": "cursor", "path": str(mdc_path), "changed": changed, "diff": diff})
-            continue
-
         dst_path, inner = compiled_blocks[hid]
         if remove and not dst_path.is_file():
             file_results.append({"target": hid, "path": str(dst_path), "changed": False, "diff": ""})
             continue
 
         old_txt = dst_path.read_text(encoding="utf-8") if dst_path.is_file() else ""
-        new_txt = _upsert_managed_block(old_txt, inner, remove=remove)
+        if hid == "cursor" and not old_txt and not remove:
+            header = "---\ndescription: PAOS Cross-Harness Shared Core Rules & Memory Pointers\nalwaysApply: true\n---\n"
+            new_txt = _upsert_managed_block(header, inner, remove=False)
+        else:
+            new_txt = _upsert_managed_block(old_txt, inner, remove=remove)
+            if hid == "cursor" and remove and new_txt.strip() in (
+                "---\ndescription: PAOS Cross-Harness Shared Core Rules & Memory Pointers\nalwaysApply: true\n---",
+                "",
+            ):
+                new_txt = ""
+
         diff = "".join(
             difflib.unified_diff(
                 old_txt.splitlines(keepends=True),
@@ -248,8 +278,7 @@ def sync_brain(
             if remove and not new_txt and dst_path.is_file():
                 dst_path.unlink()
             else:
-                dst_path.parent.mkdir(parents=True, exist_ok=True)
-                dst_path.write_text(new_txt, encoding="utf-8")
+                _write_preserving_symlink(dst_path, new_txt)
         file_results.append({"target": hid, "path": str(dst_path), "changed": changed, "diff": diff})
 
     return {

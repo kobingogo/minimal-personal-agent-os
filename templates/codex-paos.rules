@@ -4,12 +4,12 @@
 
 # 1. Destructive root / home directory wipes -> FORBIDDEN
 prefix_rule(
-    pattern=["rm", ["-rf", "-fr", "-r", "--recursive"], ["/", "/*", "~", "~/", "$HOME", ".."]],
+    pattern=["rm", ["-rf", "-fr", "-r", "--recursive"], ["/", "/*", "~", "~/", "~/*", "$HOME", ".."]],
     decision="forbidden",
     justification="PAOS: 禁止递归删除系统根目录、家目录或上级父目录",
 )
 prefix_rule(
-    pattern=["sudo", "rm", ["-rf", "-fr", "-r", "--recursive"], ["/", "/*", "~", "~/", "$HOME", ".."]],
+    pattern=["sudo", "rm", ["-rf", "-fr", "-r", "--recursive"], ["/", "/*", "~", "~/", "~/*", "$HOME", ".."]],
     decision="forbidden",
     justification="PAOS: 禁止提权递归删除系统根目录或家目录",
 )
@@ -19,6 +19,11 @@ prefix_rule(
     pattern=["git", "push", ["-f", "--force", "--force-with-lease"]],
     decision="forbidden",
     justification="PAOS: 禁止自动执行 git push --force 覆盖远端历史，请改用新分支或由人工执行",
+)
+prefix_rule(
+    pattern=["git", "push", ["origin", "upstream"], ["-f", "--force", "--force-with-lease"]],
+    decision="forbidden",
+    justification="PAOS: 禁止向远端仓库执行 git push origin --force",
 )
 prefix_rule(
     pattern=["git", "reset", "--hard"],
@@ -31,21 +36,21 @@ prefix_rule(
     justification="PAOS: 禁止 Agent 删除远端 GitHub 仓库",
 )
 
-# 3. PixelLeak defense (2026-09): force explicit human prompt on any repo/gist creation
+# 3. PixelLeak defense: require explicit human confirmation on any repo/gist creation
 prefix_rule(
     pattern=["gh", "repo", "create"],
     decision="prompt",
-    justification="PAOS: 防范 PixelLeak 公开建仓外泄——创建远端仓库必须经人工显式确认",
+    justification="PAOS: 创建远端仓库必须经人工确认（防范公开建仓泄密）",
 )
 prefix_rule(
     pattern=["gh", "gist", "create"],
     decision="prompt",
-    justification="PAOS: 防范敏感代码/截图外传——创建 GitHub Gist 必须经人工显式确认",
+    justification="PAOS: 创建 GitHub Gist 必须经人工确认（防范代码/截图外泄）",
 )
 
-# 4. Guardrail self-tampering defense -> FORBIDDEN
+# 4. Control-plane & guardrail self-tampering defense -> FORBIDDEN
 prefix_rule(
-    pattern=["rm", ["-f", "-rf", "-fr"], "~/.codex/rules/paos-guardrails.rules"],
+    pattern=["rm", ["-f", "-rf", "-fr", "-r"], ["~/.codex/rules/paos-guardrails.rules", "~/.codex/rules", "~/.codex", "~/.claude", "~/.paos"]],
     decision="forbidden",
-    justification="PAOS: 禁止 Agent 删除自身安全策略文件",
+    justification="PAOS: 禁止 Agent 删除安全控制面目录或规则文件",
 )

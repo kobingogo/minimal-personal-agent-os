@@ -1,100 +1,86 @@
 {
+  "_comment": "Neutral starter profiles. Run `paos init` to generate `~/.paos/skill-profiles.json` tailored to your installed skills.",
   "always_keep": [
-    "daily-intel",
-    "agy-customizations",
-    "antigravity-guide"
+    "find-skills",
+    "*guide*",
+    "*custom*"
   ],
   "always_keep_agy_plugins": [
-    "agy-fast",
-    "egm"
+    "agy-fast"
   ],
   "profiles": {
     "minimal": {
-      "description": "极致精简档：仅保留核心通用主力（日常轻量问答，五端最低启动上下文税）",
+      "description": "精简问答档：仅保留高频检索与通用基础技能（跨端最低启动 Token 税）",
       "keep": [
-        "mac-deep-clean",
-        "oss-picker",
-        "find-skills"
+        "*search*",
+        "*intel*",
+        "*clean*"
       ],
       "agy_plugins": []
     },
-    "writing": {
-      "description": "内容创作档：长文去 AI 味 + X 草稿无损排版 + 封面与信息图引擎 + 多平台检索",
+    "coding": {
+      "description": "软件工程档：TDD / 代码审查 / 调试排障 / 浏览器与工作流编排",
       "keep": [
-        "*tweet*",
-        "*infographic*",
-        "*longform*",
-        "x-article-draft",
-        "nextx",
-        "agent-reach",
-        "last30days*",
-        "*xiaohei*",
-        "punk-cover",
-        "proof-as-graphic",
-        "*publish*"
+        "*tdd*",
+        "*test*",
+        "*review*",
+        "*debug*",
+        "*design*",
+        "*git*",
+        "*devtools*",
+        "*workflow*"
       ],
       "agy_plugins": [
-        "chrome-devtools-plugin"
+        "*devtools*",
+        "*sdk*"
       ]
     },
-    "coding": {
-      "description": "软件工程档：TDD + 代码审查 + 架构设计 + 浏览器调试 + 逆向与安全排障",
+    "writing": {
+      "description": "内容创作档：长文写作 / 草稿排版 / 配图信息图 / 多源素材检索",
       "keep": [
-        "tdd",
-        "code-review",
-        "diagnosing-bugs",
-        "codebase-design",
-        "git-guardrails*",
-        "chrome-devtools",
-        "memory-leak-debugging",
-        "a11y-debugging",
-        "reverse-engineer-anything",
-        "colab-operator",
-        "run-workflow"
+        "*write*",
+        "*longform*",
+        "*article*",
+        "*draft*",
+        "*tweet*",
+        "*infographic*",
+        "*illustrat*",
+        "*cover*",
+        "*reach*",
+        "*intel*"
       ],
       "agy_plugins": [
-        "chrome-devtools-plugin",
-        "google-antigravity-sdk"
+        "*devtools*"
       ]
     },
     "video": {
-      "description": "视觉与视频产线档：HyperFrames 全家桶 + 视频路由 + 手绘与动效编排",
+      "description": "视觉与视频档：动效合成 / 画布动画 / 音画混音与渲染套件",
       "keep": [
         "*video*",
-        "hyperframes*",
-        "motion-graphics",
-        "media-use",
-        "hypit",
-        "hand-drawn-canvas-animation",
-        "colab-operator"
+        "*frame*",
+        "*motion*",
+        "*animat*",
+        "*media*",
+        "*audio*"
       ],
       "agy_plugins": [
-        "chrome-devtools-plugin"
+        "*devtools*"
       ]
     },
-    "lark": {
-      "description": "飞书协同办公档：云文档 / 多维表格 / 日历 / 会议妙记 / IM / 审批全套套件",
+    "ops": {
+      "description": "协同办公档：云文档 / 表格 / 日历 / 会议纪要 / IM / 邮件套件",
       "keep": [
-        "lark-*"
+        "lark-*",
+        "*feishu*",
+        "*notion*",
+        "*slack*",
+        "*calendar*",
+        "*mail*"
       ],
       "agy_plugins": []
     },
-    "science": {
-      "description": "科研与生信文献档：按需唤醒 AlphaFold / 基因组 / 化学信息学 / 学术文献检索套件",
-      "keep": [
-        "colab-operator",
-        "oss-picker"
-      ],
-      "agy_plugins": [
-        "chemistry",
-        "genomics",
-        "structural-biology",
-        "scientific-literature",
-        "science-overview"
-      ]
-    },
     "all": {
-      "description": "全量恢复档：恢复挂载技能仓与插件包中全部可用项（高上下文占用，仅排查时使用）",
+      "description": "全量恢复档：恢复挂载技能仓与插件包中全部可用项",
       "keep": [
         "*"
       ],

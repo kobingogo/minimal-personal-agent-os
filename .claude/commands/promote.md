@@ -1,9 +1,8 @@
-执行周末规则进化审阅（`/promote`）：
+执行规则进化晋升审阅（`/promote`）：
 
-1. 读取 `memory/learnings.md`、`AGENTS.md` 和 `.claude/skills/` 目录清单。
-2. 统计 `learnings.md` 中带有 `[tag:xxx]` 或同语义重复出现 **≥2 次** 的摩擦点。
-3. 按「确定性优先于文字」铁律，为每个高频摩擦生成晋升提案：
-   - **第一优先级（写成代码/Hook）**：能否在 `hooks/pre_tool_gate.py`、测试脚本或 Lint 中硬拦截？
-   - **第二优先级（封进专项 Skill）**：是否只属于某类垂直工序，应写入对应 `.claude/skills/<name>/SKILL.md` 的验收清单？
-   - **第三优先级（最后才写进 `AGENTS.md`）**：若必须写全局规则，控制在一句话以内，并检查 `AGENTS.md` 里是否有已被自动化守住、可以**立刻删除**的旧文字规则。
-4. **硬门禁**：先仅输出拟议的 **Unified Diff 预览与清理计划**，严禁未经我明确确认直接修改 `AGENTS.md`、`.claude/skills/` 或钩子脚本。待我批准后，执行写入并将 `learnings.md` 中已晋升条目移至「已归档」区。
+1. 运行 `paos promote`（或读取 `~/.paos/brain/memory/learnings.md`）查看未带 `[promoted:...]` 标记且复发 ≥2 次的 `[tag:...]` 摩擦点。
+2. 按「确定性代码优先于纯文字叮嘱」铁律，为每个高频标签生成晋升 Diff 提案：
+   - **第一优先级（写成钩子/单测/Lint）**：优先落入守卫测试或 `lib/paos/gate.py` 确定性拦截；
+   - **第二优先级（写入垂直 Skill）**：仅属特定领域的工序写入对应 `SKILL.md`；
+   - **第三优先级（写入 `~/.paos/brain/CORE_RULES.md`）**：控制在一句话以内，并删除已被脚本守住的旧文字规则。
+3. **硬门禁**：先仅输出 Unified Diff 等待人工确认；确认落地后，运行 `paos promote --apply && paos sync` 将对应条目打上 `[promoted:YYYY-MM-DD]` 标记并同步四端。

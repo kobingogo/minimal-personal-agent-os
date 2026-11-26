@@ -1,0 +1,49 @@
+{
+  "_comment": "Full-stack multi-domain power-user example (`cp config/skill-profiles.example.json ~/.paos/skill-profiles.json`).",
+  "always_keep": [
+    "daily-intel",
+    "agy-customizations",
+    "antigravity-guide"
+  ],
+  "always_keep_agy_plugins": [
+    "agy-fast",
+    "egm"
+  ],
+  "profiles": {
+    "minimal": {
+      "description": "极致精简档：仅保留核心通用主力",
+      "keep": ["mac-deep-clean", "oss-picker", "find-skills"],
+      "agy_plugins": []
+    },
+    "writing": {
+      "description": "内容创作档：长文去 AI 味 + X 草稿排版 + 封面信息图 + 多平台检索",
+      "keep": ["*tweet*", "*infographic*", "*longform*", "x-article-draft", "nextx", "agent-reach", "last30days*", "*illustrat*", "*cover*"],
+      "agy_plugins": ["chrome-devtools-plugin"]
+    },
+    "coding": {
+      "description": "软件工程档：TDD + 审查 + 浏览器调试 + 逆向与云端算力",
+      "keep": ["tdd", "code-review", "diagnosing-bugs", "codebase-design", "chrome-devtools", "memory-leak-debugging", "a11y-debugging", "reverse-engineer-anything", "colab-operator", "run-workflow"],
+      "agy_plugins": ["chrome-devtools-plugin", "google-antigravity-sdk"]
+    },
+    "video": {
+      "description": "视觉与视频档：HyperFrames 全家桶 + 视频路由 + 手绘动画",
+      "keep": ["*video*", "hyperframes*", "motion-graphics", "media-use", "hypit", "hand-drawn-canvas-animation", "colab-operator"],
+      "agy_plugins": ["chrome-devtools-plugin"]
+    },
+    "lark": {
+      "description": "飞书协同档：文档 / 多维表格 / 日历 / 妙记 / IM / 审批",
+      "keep": ["lark-*"],
+      "agy_plugins": []
+    },
+    "science": {
+      "description": "科研档：化学 / 基因组 / 结构生物 / 文献检索插件包",
+      "keep": ["colab-operator", "oss-picker"],
+      "agy_plugins": ["chemistry", "genomics", "structural-biology", "scientific-literature", "science-overview"]
+    },
+    "all": {
+      "description": "全量恢复档",
+      "keep": ["*"],
+      "agy_plugins": ["*"]
+    }
+  }
+}

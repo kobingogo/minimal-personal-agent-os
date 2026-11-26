@@ -14,21 +14,30 @@ chmod +x "$PAOS_BIN" "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh
 if [ "${1:-}" = "--dry-run" ]; then
   "$PAOS_BIN" matrix
   echo ""
+  "$PAOS_BIN" sync --dry-run
+  echo ""
   exec "$PAOS_BIN" harden --all --dry-run
 fi
 
-echo "==> [1/4] 非破坏性合并 Claude 沙盒钩子与 Codex Starlark 门禁 (自动备份已有配置)..."
+echo "==> [1/4] 初始化 ~/.paos/brain 跨端共享大脑与本机档位配置..."
+"$PAOS_BIN" init
+"$PAOS_BIN" sync
+
+echo ""
+echo "==> [2/4] 非破坏性合并 Claude 沙盒钩子与 Codex Starlark 门禁 (自动备份已有配置)..."
 "$PAOS_BIN" harden --all
 
 echo ""
-echo "==> [2/4] 运行词法级 PreToolUse 拦截器自检 (零外部依赖)..."
+echo "==> [3/4] 运行词法级 PreToolUse 拦截器隔离自检 (临时沙盒日志，不污染真实 audit.jsonl)..."
 GATE="$HOME/.claude/hooks/pre_tool_gate.py"
+SELFTEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/paos-selftest.XXXXXX")"
+trap 'rm -rf "$SELFTEST_HOME" 2>/dev/null || true' EXIT
 
 assert_block() {
   local label="$1"
   local payload="$2"
   local rc=0
-  printf '%s' "$payload" | "$GATE" >/dev/null 2>&1 || rc=$?
+  printf '%s' "$payload" | PAOS_HOME_DIR="$SELFTEST_HOME" "$GATE" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ne 2 ]; then
     echo "    [FAIL] 预期拦截却放行 (exit=$rc): $label" >&2
     exit 1
@@ -40,7 +49,7 @@ assert_allow() {
   local label="$1"
   local payload="$2"
   local rc=0
-  printf '%s' "$payload" | "$GATE" >/dev/null 2>&1 || rc=$?
+  printf '%s' "$payload" | PAOS_HOME_DIR="$SELFTEST_HOME" "$GATE" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "    [FAIL] 预期放行却误杀 (exit=$rc): $label" >&2
     exit 1
@@ -50,7 +59,7 @@ assert_allow() {
 
 assert_block "git push -f origin main"       '{"tool_name":"Bash","tool_input":{"command":"git push -f origin main"}}'
 assert_block "gh repo create leak --public"  '{"tool_name":"Bash","tool_input":{"command":"gh repo create leak --public"}}'
-assert_block "gh gist create -p ui.png"      '{"tool_name":"Bash","tool_input":{"command":"gh gist create -p ui.png"}}'
+assert_block "sudo -u root rm -rf /"         '{"tool_name":"Bash","tool_input":{"command":"sudo -u root rm -rf /"}}'
 assert_block "echo \"\$(rm -fr ~)\""         '{"tool_name":"Bash","tool_input":{"command":"echo \"$(rm -fr ~)\""}}'
 assert_block "篡改 ~/.claude/settings.json"  '{"tool_name":"Write","tool_input":{"file_path":"~/.claude/settings.json"}}'
 assert_allow "rm -rf /tmp/cache"             '{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/cache"}}'
@@ -58,14 +67,9 @@ assert_allow "commit 消息含 git push -f 文本" '{"tool_name":"Bash","tool_in
 assert_allow "env FOO=1 npm test"            '{"tool_name":"Bash","tool_input":{"command":"env FOO=1 npm test"}}'
 
 echo ""
-echo "==> [3/4] 运行本机 PAOS Doctor 真机体检..."
-"$PAOS_BIN" doctor --workspace "$REPO_DIR" || true
+echo "==> [4/4] 扫描本机五大客户端矩阵与仪表盘状态..."
+"$PAOS_BIN" status
 
 echo ""
-echo "==> [4/4] 扫描本机五大客户端 Cross-Harness 技能矩阵..."
-"$PAOS_BIN" matrix
-
-echo ""
-echo "部署完成！建议将 paos 加入 PATH："
-echo "  ln -sf \"$PAOS_BIN\" ~/.local/bin/paos"
-echo "启动个人 OS：cd \"$REPO_DIR\" && claude （输入 /triage 开始今日分诊）"
+echo "部署完成！建议将 paos 加入 PATH（确保 ~/.local/bin 在你的 ~/.zshrc / ~/.bashrc PATH 中）："
+echo "  mkdir -p ~/.local/bin && ln -sf \"$PAOS_BIN\" ~/.local/bin/paos"
