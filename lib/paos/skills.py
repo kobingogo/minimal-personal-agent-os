@@ -116,12 +116,16 @@ def park_skills(names: List[str], home_dir: Path | None = None) -> Tuple[List[st
             missing.append(name)
             continue
         dst = off_dir / name
-        if dst.exists() or dst.is_symlink():
-            if dst.is_symlink() or dst.is_file():
-                dst.unlink()
-            else:
-                shutil.rmtree(dst)
-        shutil.move(str(src), str(dst))
+        if src.is_symlink() and dst.is_dir() and not dst.is_symlink():
+            # Preserve the real directory already in skills-off/ instead of deleting it!
+            src.unlink()
+        else:
+            if dst.exists() or dst.is_symlink():
+                if dst.is_symlink() or dst.is_file():
+                    dst.unlink()
+                else:
+                    shutil.rmtree(dst)
+            shutil.move(str(src), str(dst))
         moved.append(name)
 
     if moved:
@@ -143,12 +147,15 @@ def enable_skills(names: List[str], home_dir: Path | None = None) -> Tuple[List[
             missing.append(name)
             continue
         dst = active_dir / name
-        if dst.exists() or dst.is_symlink():
-            if dst.is_symlink() or dst.is_file():
-                dst.unlink()
-            else:
-                shutil.rmtree(dst)
-        shutil.move(str(src), str(dst))
+        if src.is_symlink() and dst.is_dir() and not dst.is_symlink():
+            src.unlink()
+        else:
+            if dst.exists() or dst.is_symlink():
+                if dst.is_symlink() or dst.is_file():
+                    dst.unlink()
+                else:
+                    shutil.rmtree(dst)
+            shutil.move(str(src), str(dst))
         restored.append(name)
 
     if restored:

@@ -8,21 +8,30 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 from typing import Any, Dict, List
 
 from .skills import list_skills
 
 INLINE_SECRET_PATTERNS = [
-    ("OpenAI/Anthropic/API Key", re.compile(r"\bsk-[a-zA-Z0-9_-]{16,}")),
-    ("GitHub PAT", re.compile(r"\b(ghp_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{20,})")),
-    ("Google API Key", re.compile(r"\bAIza[a-zA-Z0-9_-]{20,}")),
-    ("Slack Token", re.compile(r"\bxox[baprs]-[a-zA-Z0-9-]{15,}")),
-    ("Database URI Password", re.compile(r"\b(postgres|postgresql|mysql|mongodb|redis)://[^/\s:@]+:[^/\s@]+@")),
-    ("Inline Secret Assignment", re.compile(r"\b(PGPASSWORD|PASSWORD|API_KEY|AUTH_TOKEN|SECRET_KEY|AWS_SECRET_ACCESS_KEY)\s*=\s*['\"]?[^\s'\"]{4,}", re.I)),
+    ("OpenAI/Anthropic/API Key", re.compile(r"\bsk-[a-zA-Z0-9_-]{12,}")),
+    ("GitHub PAT", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{16,}|\bgithub_pat_[a-zA-Z0-9_]{16,}")),
+    ("Google API Key", re.compile(r"\bAIza[a-zA-Z0-9_-]{16,}")),
+    ("Slack/Telegram Token", re.compile(r"\bxox[baprs]-[a-zA-Z0-9-]{12,}|\b(?:bot)?\d{8,12}:[A-Za-z0-9_-]{30,}")),
+    ("URI Password", re.compile(r"\b(?:postgres|postgresql|mysql|mongodb|redis|https?)://[^/\s:@]+:[^/\s@]+@")),
+    (
+        "Inline Secret Assignment",
+        re.compile(
+            r"\b(?:[A-Za-z0-9_]+_)?(?:PASSWORD|PASSWD|API_KEY|APIKEY|AUTH_TOKEN|ACCESS_TOKEN|SECRET_KEY|PRIVATE_KEY|BOT_TOKEN|WEBHOOK_URL|CLIENT_SECRET|ACCESS_KEY)\b\s*[:=]\s*['\"]?[^\s'\"&,;}\]]{4,}",
+            re.I,
+        ),
+    ),
 ]
 
 TAG_RE = re.compile(r"\[tag:([a-zA-Z0-9_-]+)\]")
+PROMOTED_RE = re.compile(r"\[promoted:")
 
 
 class Finding:
@@ -116,7 +125,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     "WARN",
                     "context",
                     f"~/.claude.json 客户端状态文件膨胀 ({sz_kb:.1f} KB > 40 KB)，积压旧项目缓存易拖慢启动",
-                    "清理 ~/.claude.json 中已废弃的 projects 历史条目与失效 MCP 记录",
+                    "运行 `paos clean --prune-claude-state` 自动备份并清理已删除项目的陈旧缓存",
                 )
             )
 
@@ -155,22 +164,33 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     )
                 )
 
-    # Check MEMORY.md 200-line / 25KB hard cliff across workspace & ~/.claude/projects
-    mem_candidates = [ws / "memory" / "MEMORY.md"]
+    # Check MEMORY.md 200-line / 25KB hard cliff across workspace, shared brain & ~/.claude/projects
+    raw_mem_candidates = [
+        ws / "memory" / "MEMORY.md",
+        home / ".paos" / "brain" / "memory" / "MEMORY.md",
+    ]
     proj_glob = glob.glob(str(home / ".claude" / "projects" / "*" / "memory" / "MEMORY.md"))
-    mem_candidates.extend(Path(x) for x in proj_glob)
+    raw_mem_candidates.extend(Path(x) for x in proj_glob)
+
+    seen_mem: set[Path] = set()
+    mem_candidates: List[Path] = []
+    for mp in raw_mem_candidates:
+        if mp.is_file():
+            rp = mp.resolve()
+            if rp not in seen_mem:
+                seen_mem.add(rp)
+                mem_candidates.append(mp)
 
     over_cliff: List[str] = []
     for mp in mem_candidates:
-        if mp.is_file():
-            try:
-                raw_bytes = mp.read_bytes()
-                line_cnt = len(raw_bytes.decode("utf-8", errors="replace").splitlines())
-                kb = len(raw_bytes) / 1024.0
-                if line_cnt > 200 or kb > 25.0:
-                    over_cliff.append(f"{mp.parent.parent.name}/MEMORY.md ({line_cnt} 行, {kb:.1f}KB)")
-            except OSError:
-                pass
+        try:
+            raw_bytes = mp.read_bytes()
+            line_cnt = len(raw_bytes.decode("utf-8", errors="replace").splitlines())
+            kb = len(raw_bytes) / 1024.0
+            if line_cnt > 200 or kb > 25.0:
+                over_cliff.append(f"{mp.parent.parent.name}/MEMORY.md ({line_cnt} 行, {kb:.1f}KB)")
+        except OSError:
+            pass
 
     if over_cliff:
         findings.append(
@@ -191,6 +211,7 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
     # =========================================================================
     settings_path = home / ".claude" / "settings.json"
     settings_obj: Dict[str, Any] = {}
+    settings_loaded = False
     if not settings_path.is_file():
         findings.append(
             Finding(
@@ -202,14 +223,20 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
         )
     else:
         try:
-            settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
+            parsed_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            if not isinstance(parsed_settings, dict):
+                findings.append(
+                    Finding("FAIL", "sandbox", "~/.claude/settings.json 顶层必须是 JSON 对象", "修复 JSON 或运行 `paos harden`")
+                )
+            else:
+                settings_obj = parsed_settings
+                settings_loaded = True
         except json.JSONDecodeError as exc:
             findings.append(
                 Finding("FAIL", "sandbox", f"~/.claude/settings.json JSON 语法损坏: {exc}", "修复 JSON 或运行 `paos rollback`")
             )
-            settings_obj = {}
 
-    if settings_obj:
+    if settings_loaded:
         sb = settings_obj.get("sandbox") or {}
         if not isinstance(sb, dict) or not sb.get("enabled"):
             findings.append(
@@ -252,17 +279,31 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
             )
 
         perms_deny = " ".join(str(x) for x in ((settings_obj.get("permissions") or {}).get("deny") or []))
-        if "Read(.env" not in perms_deny:
+        if "Read(.env" not in perms_deny or "Write(~/.claude" not in perms_deny or "Edit(~/.claude" not in perms_deny:
             findings.append(
                 Finding(
                     "WARN",
                     "sandbox",
-                    "permissions.deny 未封禁内置 Read(.env) 工具（OS 沙盒仅约束 Shell 子进程，管不到内置 Read）",
+                    "permissions.deny 未完整封禁内置 Read(.env) 或 Write/Edit(~/.claude/**) 工具",
                     "运行 `paos harden` 同步写入 permissions.deny",
                 )
             )
         else:
             findings.append(Finding("PASS", "sandbox", "内置 Read(.env) 与 ~/.claude 写权限双锁已生效"))
+
+    if (home / ".codex").is_dir():
+        codex_guard = home / ".codex" / "rules" / "paos-guardrails.rules"
+        if codex_guard.is_file():
+            findings.append(Finding("PASS", "sandbox", "Codex Starlark 命令门禁 (paos-guardrails.rules) 已就位"))
+        else:
+            findings.append(
+                Finding(
+                    "WARN",
+                    "sandbox",
+                    "检测到本机已安装 Codex (~/.codex)，但尚未部署 Starlark 命令门禁规则",
+                    "运行 `paos harden --all` 或 `paos harden --codex` 生成并校验 paos-guardrails.rules",
+                )
+            )
 
     # =========================================================================
     # Dimension 3: Hooks Schema & Fail-Closed Validation
@@ -292,16 +333,33 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
                     continue
                 for h in m_obj["hooks"]:
                     if isinstance(h, dict) and h.get("type") == "command" and h.get("command"):
-                        raw_cmd = str(h["command"]).strip().split()[0]
-                        if not raw_cmd.startswith("$"):
-                            cmd_paths.append(_expand_user(raw_cmd, home))
+                        try:
+                            toks = shlex.split(str(h["command"]).strip())
+                        except ValueError:
+                            toks = str(h["command"]).strip().split()
+                        if not toks:
+                            continue
+                        first = toks[0]
+                        if os.path.basename(first) in ("python", "python3", "bash", "sh", "zsh", "node"):
+                            script_args = [t for t in toks[1:] if not t.startswith("-")]
+                            if script_args and not script_args[0].startswith("$"):
+                                cmd_paths.append((_expand_user(script_args[0], home), False))
+                        elif not first.startswith("$"):
+                            if "/" in first or first.startswith("~"):
+                                cmd_paths.append((_expand_user(first, home), True))
+                            elif not shutil.which(first):
+                                cmd_paths.append((Path(first), True))
 
         if schema_errors:
             findings.append(
                 Finding("FAIL", "hooks", "Hooks Schema 错误：" + "；".join(schema_errors), "改为三层嵌套结构或运行 `paos harden`")
             )
         else:
-            missing_exec = [str(p) for p in cmd_paths if not (p.is_file() and os.access(p, os.X_OK))]
+            missing_exec = [
+                str(p)
+                for p, need_x in cmd_paths
+                if not (p.is_file() and (os.access(p, os.X_OK) if need_x else True))
+            ]
             if missing_exec:
                 findings.append(
                     Finding(
@@ -389,16 +447,24 @@ def run_doctor(workspace: Path | None = None, home_dir: Path | None = None) -> D
     # Dimension 5: Learnings Evolution Loop
     # =========================================================================
     learn_file = ws / "memory" / "learnings.md"
+    if not learn_file.is_file():
+        shared_learn = home / ".paos" / "brain" / "memory" / "learnings.md"
+        if shared_learn.is_file():
+            learn_file = shared_learn
+
     if learn_file.is_file():
-        tags = Counter(TAG_RE.findall(learn_file.read_text(encoding="utf-8", errors="replace")))
-        recurring = [f"{t}({c}次)" for t, c in tags.most_common() if c >= 2]
+        counts_tag: Counter[str] = Counter()
+        for line in learn_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not PROMOTED_RE.search(line):
+                counts_tag.update(dict.fromkeys(TAG_RE.findall(line)).keys())
+        recurring = [f"{t}({c}次)" for t, c in counts_tag.most_common() if c >= 2]
         if recurring:
             findings.append(
                 Finding(
                     "WARN",
                     "evolution",
                     f"learnings.md 中有复发纠偏待晋升：{', '.join(recurring)}",
-                    "周末在 Claude Code 中运行 `/promote` 生成脚本/Hook 晋升 Diff，落地后删除旧文字规则",
+                    "运行 `paos promote` 审阅复发坑点并晋升为确定性脚本/钩子，随后加 `[promoted:...]` 归档",
                 )
             )
         else:

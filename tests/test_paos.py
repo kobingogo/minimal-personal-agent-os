@@ -1,37 +1,52 @@
 #!/usr/bin/env python3
-"""Comprehensive unit & integration test suite for PAOS v0.2 (zero third-party deps)."""
+"""Comprehensive unit & integration test suite for PAOS v0.1.0 (zero third-party deps)."""
 
 from __future__ import annotations
 
+import atexit
 from datetime import date, timedelta
+import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "lib"))
 sys.path.insert(0, str(REPO_ROOT / "hooks"))
 
+from paos.audit import append_audit_event, read_audit_events, redact_secrets  # noqa: E402
+from paos.cron import (  # noqa: E402
+    execute_cron_job_now,
+    install_cron_job,
+    list_cron_jobs,
+    remove_cron_job,
+)
 from paos.doctor import run_doctor  # noqa: E402
 from paos.harden import (  # noqa: E402
     apply_codex_harden,
     apply_harden,
-     rollback_settings,
+    rollback_settings,
 )
 from paos.harnesses import (  # noqa: E402
     adopt_skills,
     clean_harnesses,
+    prune_claude_state_json,
     restore_links,
     scan_agy_plugins,
     scan_matrix,
     set_agy_plugins_state,
     use_profile,
 )
+from paos.notify import send_notification  # noqa: E402
+from paos.scheduler import run_cold_review, run_task  # noqa: E402
 from paos.skills import (  # noqa: E402
     apply_profile,
     clean_broken_skills,
@@ -39,18 +54,25 @@ from paos.skills import (  # noqa: E402
     list_skills,
     park_skills,
 )
+from paos.sync_bus import init_brain, promote_learnings, sync_brain  # noqa: E402
 import load_recent_memory  # noqa: E402
 
 GATE_SCRIPT = REPO_ROOT / "hooks" / "pre_tool_gate.py"
 STOP_SCRIPT = REPO_ROOT / "hooks" / "stop_verify.py"
 PAOS_BIN = REPO_ROOT / "bin" / "paos"
 
+_TEST_GATE_HOME = Path(tempfile.mkdtemp(prefix="paos-gate-home-"))
+atexit.register(lambda: shutil.rmtree(_TEST_GATE_HOME, ignore_errors=True))
 
-def run_gate(payload: dict | str) -> subprocess.CompletedProcess[str]:
+
+def run_gate(payload: dict | str, home_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
     raw = payload if isinstance(payload, str) else json.dumps(payload)
+    env = os.environ.copy()
+    env["PAOS_HOME_DIR"] = str(home_dir or _TEST_GATE_HOME)
     return subprocess.run(
         [sys.executable, str(GATE_SCRIPT)],
         input=raw,
+        env=env,
         text=True,
         capture_output=True,
         timeout=10,
@@ -151,6 +173,7 @@ class TestStopVerifyLoopBreaker(unittest.TestCase):
         env = os.environ.copy()
         env["PAOS_VERIFY_CMD"] = "exit 1"
         env["PAOS_MAX_STOP_RETRIES"] = "2"
+        env["PAOS_HOME_DIR"] = str(self.tmp)
 
         r_clean = subprocess.run(
             [sys.executable, str(STOP_SCRIPT)],
@@ -423,6 +446,382 @@ class TestCrossHarnessControlPlaneV02(unittest.TestCase):
         after = scan_agy_plugins(self.home)
         self.assertEqual(after["enabled_count"], 0)
         self.assertEqual(after["disabled_count"], 1)
+
+
+class TestPaosV1KernelPrimitives(unittest.TestCase):
+    """End-to-end tests for PAOS v0.1.0: audit, sync_bus, promote, scheduler, review, notify, cron, state prune."""
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp(prefix="paos-v1-home-"))
+        self.repo = Path(tempfile.mkdtemp(prefix="paos-v1-repo-"))
+        subprocess.run(["git", "init", "-q"], cwd=str(self.repo), check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.repo), check=True)
+        subprocess.run(["git", "config", "user.name", "PAOS Test"], cwd=str(self.repo), check=True)
+        (self.repo / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        subprocess.run(["git", "add", "app.py"], cwd=str(self.repo), check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(self.repo), check=True)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.home, ignore_errors=True)
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def test_audit_redaction_and_gate_block_trail(self) -> None:
+        tok = "sk-proj-" + "AUDIT_TEST_SECRET_TOKEN_123456"
+        r = run_gate(
+            {"tool_name": "Bash", "tool_input": {"command": f"API_KEY={tok} rm -rf /"}},
+            home_dir=self.home,
+        )
+        self.assertEqual(r.returncode, 2)
+        append_audit_event(
+            event_type="task_run",
+            status="failed",
+            summary=f"Failed with key {tok} and postgres://adm:superpass@localhost/db",
+            home_dir=self.home,
+        )
+
+        events = read_audit_events(home_dir=self.home, blocks_only=True)
+        self.assertEqual(len(events), 2)
+        raw_log = (self.home / ".paos" / "logs" / "audit.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(tok, raw_log)
+        self.assertNotIn("superpass", raw_log)
+        self.assertIn("***REDACTED***", raw_log)
+
+    def test_sync_bus_non_destructive_blocks_and_promote(self) -> None:
+        (self.home / ".claude").mkdir(parents=True)
+        (self.home / ".codex").mkdir(parents=True)
+        (self.home / ".gemini").mkdir(parents=True)
+        (self.home / ".cursor").mkdir(parents=True)
+
+        (self.home / ".codex" / "AGENTS.md").write_text("@RTK.md\n\n# My Custom Codex Rules\n", encoding="utf-8")
+        (self.home / ".gemini" / "GEMINI.md").write_text("# Handwritten Ultra Rules\n- Rule 1\n", encoding="utf-8")
+
+        ib = init_brain(home_dir=self.home)
+        self.assertGreaterEqual(len(ib["created_files"]), 5)
+
+        learn_p = Path(ib["brain_dir"]) / "memory" / "learnings.md"
+        learn_p.write_text(
+            "- [2026-11-25] [tag:cache-bust] image broke ttft\n"
+            "- [2026-11-26] [tag:cache-bust] large screenshot broke cache\n",
+            encoding="utf-8",
+        )
+
+        s1 = sync_brain(home_dir=self.home)
+        self.assertEqual(set(s1["targets"]), {"claude", "codex", "antigravity", "cursor"})
+        self.assertTrue(all(f["changed"] for f in s1["files"]))
+
+        # Verify user's handwritten lines & @RTK.md are 100% intact + backup created
+        codex_md = (self.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
+        gemini_md = (self.home / ".gemini" / "GEMINI.md").read_text(encoding="utf-8")
+        self.assertIn("@RTK.md", codex_md)
+        self.assertIn("My Custom Codex Rules", codex_md)
+        self.assertIn("cache-bust(2次)", codex_md)
+        self.assertIn("Handwritten Ultra Rules", gemini_md)
+        self.assertTrue((self.home / ".cursor" / "rules" / "paos-shared.mdc").is_file())
+        backups = list((self.home / ".paos" / "backups").glob("sync-*/*.bak"))
+        self.assertEqual(len(backups), 2)
+
+        # Second sync is idempotent
+        s2 = sync_brain(home_dir=self.home)
+        self.assertFalse(any(f["changed"] for f in s2["files"]))
+
+        # SessionStart hook falls back to ~/.paos/brain/memory when repo has no local memory/
+        snap_before = load_recent_memory.build_snapshot(self.repo, home_dir=self.home)
+        self.assertIn("cache-bust(2次)", snap_before)
+
+        # Promote marks entries [promoted:...] and silences repeat warnings
+        prm = promote_learnings(learn_p, threshold=2, mark_promoted=True)
+        self.assertEqual(len(prm["candidates"]), 1)
+        self.assertEqual(prm["marked_count"], 2)
+        snap_after = load_recent_memory.build_snapshot(self.repo, home_dir=self.home)
+        self.assertNotIn("cache-bust(2次)", snap_after)
+
+        # Remove strips PAOS block cleanly while preserving handwritten content
+        sync_brain(home_dir=self.home, remove=True)
+        self.assertEqual(
+            (self.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8"),
+            "@RTK.md\n\n# My Custom Codex Rules\n",
+        )
+        self.assertFalse((self.home / ".cursor" / "rules" / "paos-shared.mdc").exists())
+
+    def test_prune_claude_state_dual_rollback_and_plugin_profile_switch(self) -> None:
+        live_proj = self.repo
+        dead_proj_1 = self.home / "deleted-project-alpha"
+        dead_proj_2 = self.home / "deleted-project-beta"
+        cjson = self.home / ".claude.json"
+        cjson.write_text(
+            json.dumps(
+                {
+                    "numStartups": 42,
+                    "projects": {
+                        str(live_proj): {"hasTrustDialogAccepted": True},
+                        str(dead_proj_1): {"history": ["old"] * 50},
+                        str(dead_proj_2): {"history": ["stale"] * 50},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cln = clean_harnesses(home_dir=self.home, prune_claude_state=True)
+        self.assertEqual(len(cln["pruned_claude_projects"]), 2)
+        self.assertGreater(cln["reclaimed_bytes"], 50)
+        reloaded = json.loads(cjson.read_text(encoding="utf-8"))
+        self.assertEqual(reloaded["numStartups"], 42)
+        self.assertEqual(list(reloaded["projects"].keys()), [str(live_proj)])
+
+        # Test `use_profile(..., include_plugins=True)`
+        for pname in ("agy-fast", "chrome-devtools-plugin", "genomics"):
+            pd = self.home / ".gemini" / "config" / "plugins" / pname
+            pd.mkdir(parents=True)
+            (pd / "plugin.json").write_text(json.dumps({"name": pname}), encoding="utf-8")
+
+        u = use_profile(
+            "writing",
+            REPO_ROOT / "config" / "skill-profiles.json",
+            home_dir=self.home,
+            include_plugins=True,
+        )
+        self.assertIsNotNone(u["agy_plugins"])
+        self.assertEqual(u["agy_plugins"]["disabled"], ["genomics"])
+
+        # Test dual rollback (`include_codex=True`)
+        (self.home / ".claude").mkdir(parents=True, exist_ok=True)
+        (self.home / ".claude" / "settings.json").write_text('{"custom": 1}\n', encoding="utf-8")
+        apply_harden(REPO_ROOT, home_dir=self.home, configure_git=False, include_codex=True)
+        self.assertTrue((self.home / ".codex" / "rules" / "paos-guardrails.rules").is_file())
+        ok, msg = rollback_settings(home_dir=self.home, include_codex=True)
+        self.assertTrue(ok, msg)
+        self.assertFalse((self.home / ".codex" / "rules" / "paos-guardrails.rules").exists())
+
+    def test_scheduler_worktree_timeout_kill_and_goldfish_review(self) -> None:
+        # 1. Clean isolated worktree run -> auto-pruned
+        r_clean = run_task(
+            prompt="noop check",
+            workdir=self.repo,
+            use_worktree=True,
+            home_dir=self.home,
+            custom_cmd_override=[sys.executable, "-c", "print('clean worktree ok')"],
+        )
+        self.assertEqual(r_clean["status"], "ok")
+        self.assertTrue(r_clean["worktree_pruned_clean"])
+
+        # 2. Dirty isolated worktree run -> preserved for inspection while main repo stays clean
+        r_dirty = run_task(
+            prompt="write feature",
+            workdir=self.repo,
+            use_worktree=True,
+            home_dir=self.home,
+            custom_cmd_override=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('feature.py').write_text('x = 42\\n')",
+            ],
+        )
+        self.assertEqual(r_dirty["status"], "ok")
+        self.assertFalse(r_dirty["worktree_pruned_clean"])
+        self.assertFalse((self.repo / "feature.py").exists())
+        self.assertTrue((Path(r_dirty["workdir"]) / "feature.py").is_file())
+
+        # 3. Process-group timeout kills hung child + grandchild tree cleanly
+        t0 = time.monotonic()
+        r_hang = run_task(
+            prompt="hung subprocess",
+            workdir=self.repo,
+            timeout_sec=1,
+            home_dir=self.home,
+            custom_cmd_override=[
+                sys.executable,
+                "-c",
+                "import subprocess, time; subprocess.Popen(['sleep', '4']); time.sleep(10)",
+            ],
+        )
+        elapsed = time.monotonic() - t0
+        self.assertTrue(r_hang["timed_out"])
+        self.assertEqual(r_hang["exit_code"], 124)
+        self.assertLess(elapsed, 5.0)
+
+        # 4. Goldfish cold-start review P0 vs PASS gate
+        (self.repo / "app.py").write_text("def add(a, b):\n    return a - b  # bug\n", encoding="utf-8")
+        rev_p0 = run_cold_review(
+            repo_dir=self.repo,
+            home_dir=self.home,
+            custom_reviewer_cmd=[
+                sys.executable,
+                "-c",
+                "import sys; _ = sys.stdin.read(); print('- [P0] BLOCKER: subtraction instead of addition\\n[VERDICT: BLOCK_P0]')",
+            ],
+        )
+        self.assertTrue(rev_p0["has_p0"])
+        self.assertEqual(rev_p0["exit_code"], 2)
+
+        rev_pass = run_cold_review(
+            repo_dir=self.repo,
+            home_dir=self.home,
+            custom_reviewer_cmd=[
+                sys.executable,
+                "-c",
+                "import sys; _ = sys.stdin.read(); print('- [P1] Consider adding type annotations\\n[VERDICT: PASS]')",
+            ],
+        )
+        self.assertFalse(rev_pass["has_p0"])
+        self.assertEqual(rev_pass["exit_code"], 0)
+
+    def test_notify_dlp_redaction_and_cron_launchd_lifecycle(self) -> None:
+        (self.home / ".paos").mkdir(parents=True, exist_ok=True)
+        (self.home / ".paos" / "config.json").write_text(
+            json.dumps({"notify": {"feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/mock"}}),
+            encoding="utf-8",
+        )
+
+        captured_bodies: list[dict] = []
+
+        class _FakeResp:
+            status = 200
+
+            def read(self, _n: int = -1) -> bytes:
+                return b'{"StatusCode":0}'
+
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        def _fake_urlopen(req: object, timeout: int = 10) -> _FakeResp:
+            body = getattr(req, "data", b"")
+            captured_bodies.append(json.loads(body.decode("utf-8")))
+            return _FakeResp()
+
+        secret_tok = "sk-live-" + "DO_NOT_LEAK_OUTBOUND_999999"
+        with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            res = send_notification(
+                title=f"Alert {secret_tok}",
+                message=f"Conn failed: postgres://root:mysecretpw@10.0.0.1/app",
+                channel="feishu",
+                home_dir=self.home,
+            )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(captured_bodies), 1)
+        wire_str = json.dumps(captured_bodies[0], ensure_ascii=False)
+        self.assertNotIn(secret_tok, wire_str)
+        self.assertNotIn("mysecretpw", wire_str)
+        self.assertIn("***REDACTED***", wire_str)
+
+        # Test Cron install / list / atomic lock / weekly-hygiene execution / remove
+        c_inst = install_cron_job(
+            "weekly-hygiene",
+            paos_bin=PAOS_BIN,
+            hour=21,
+            minute=15,
+            weekday=0,
+            home_dir=self.home,
+            register_launchctl=False,
+        )
+        if sys.platform == "darwin":
+            plist_data = plistlib.loads(Path(c_inst["path"]).read_bytes())
+            self.assertEqual(plist_data["StartCalendarInterval"]["Hour"], 21)
+            self.assertEqual(plist_data["StartCalendarInterval"]["Minute"], 15)
+
+        jobs = {j["name"]: j for j in list_cron_jobs(home_dir=self.home)}
+        self.assertTrue(jobs["weekly-hygiene"]["installed"])
+
+        c_run = execute_cron_job_now("weekly-hygiene", repo_dir=REPO_ROOT, home_dir=self.home, notify=False)
+        self.assertEqual(c_run["status"], "ok")
+        self.assertIn("健康分:", c_run["summary"])
+
+        # Simulate active lock contention
+        preview = execute_cron_job_now("weekly-hygiene", repo_dir=REPO_ROOT, home_dir=self.home, dry_run=True)
+        lock_p = Path(preview["lock_dir"])
+        lock_p.mkdir(parents=True, exist_ok=True)
+        try:
+            c_locked = execute_cron_job_now("weekly-hygiene", repo_dir=REPO_ROOT, home_dir=self.home, notify=False)
+            self.assertEqual(c_locked["status"], "skipped_locked")
+        finally:
+            shutil.rmtree(lock_p, ignore_errors=True)
+
+        c_rm = remove_cron_job("weekly-hygiene", home_dir=self.home, register_launchctl=False)
+        self.assertTrue(c_rm["removed"])
+
+    def test_goldfish_p0_regressions_end_to_end(self) -> None:
+        # 1. Symlinked `bin/paos` + `paos matrix` CLI rendering
+        bin_link = self.home / "local-bin" / "paos"
+        bin_link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(PAOS_BIN), str(bin_link))
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+        env["PAOS_HOME_DIR"] = str(self.home)
+        env["PAOS_SKIP_LAUNCHCTL"] = "1"
+        env["PAOS_NO_OSASCRIPT"] = "1"
+        r_mat = subprocess.run([str(bin_link), "matrix"], env=env, text=True, capture_output=True, check=True)
+        self.assertIn("PAOS Matrix", r_mat.stdout)
+
+        # 2. `adopt_skills` preserves downstream `.agents/skills/foo` when `.claude/skills/foo -> .agents/skills/foo`
+        ag_foo = self.home / ".agents" / "skills" / "foo-skill"
+        cl_sk = self.home / ".claude" / "skills"
+        ag_foo.mkdir(parents=True)
+        cl_sk.mkdir(parents=True)
+        (ag_foo / "SKILL.md").write_text("---\nname: foo-skill\ndescription: demo\n---\n", encoding="utf-8")
+        os.symlink(str(ag_foo), str(cl_sk / "foo-skill"))
+        adopt_skills(home_dir=self.home)
+        self.assertTrue((self.home / ".agents" / "skills" / "foo-skill").exists())
+        self.assertTrue((self.home / ".claude" / "skills" / "foo-skill").exists())
+        ok_rst, _ = restore_links(home_dir=self.home)
+        self.assertTrue(ok_rst)
+        self.assertTrue((self.home / ".agents" / "skills" / "foo-skill").is_dir())
+        self.assertFalse((self.home / ".agents" / "skills" / "foo-skill").is_symlink())
+
+        # 3. `sync_brain` second sync with regex/Windows backslashes (`\d`, `\s`, `\u`) never crashes or corrupts
+        init_brain(home_dir=self.home)
+        core_f = self.home / ".paos" / "brain" / "CORE_RULES.md"
+        backslash_rule = r"# Rules with escapes: \d+\s+ and C:\users\demo\test" + "\n"
+        core_f.write_text(backslash_rule, encoding="utf-8")
+        sync_brain(home_dir=self.home, targets=["codex"])
+        core_f.write_text(backslash_rule + "- extra line\n", encoding="utf-8")
+        sync_brain(home_dir=self.home, targets=["codex"])
+        synced_codex = (self.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn(r"\d+\s+ and C:\users\demo\test", synced_codex)
+
+        # 4. `pre_tool_gate.py` blocks compound wrappers, `-lc`, nested `$()`, `-uf`, `gh repo delete`, path traversal
+        for bad_cmd in (
+            "{ rm -rf /; }",
+            'bash -lc "rm -rf /"',
+            'echo "$(echo \'()\'; rm -rf /)"',
+            "git push -uf origin main",
+            "gh repo delete my-org/my-repo",
+            "echo '{}' > ~/.claude/hooks/../settings.json",
+        ):
+            res_g = run_gate({"tool_name": "Bash", "tool_input": {"command": bad_cmd}}, home_dir=self.home)
+            self.assertEqual(res_g.returncode, 2, f"Expected block for: {bad_cmd}")
+
+        # 5. `doctor` catches empty `{}` `~/.claude/settings.json` + prefixed `GEMINI_API_KEY=...` redaction
+        (self.home / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
+        doc_empty = run_doctor(workspace=self.repo, home_dir=self.home)
+        self.assertGreaterEqual(doc_empty["summary"]["fail"], 1)
+        prefixed_sec = "GEMINI_API_KEY=plain_non_prefix_secret_987654"
+        self.assertNotIn("plain_non_prefix_secret_987654", redact_secrets(prefixed_sec))
+
+        # 6. `prune_claude_state_json` preserves `0o600` file permissions
+        cjson = self.home / ".claude.json"
+        cjson.write_text(
+            json.dumps({"projects": {str(self.home / "gone-dir"): {"history": []}}}),
+            encoding="utf-8",
+        )
+        os.chmod(cjson, 0o600)
+        prune_claude_state_json(home_dir=self.home)
+        self.assertEqual(cjson.stat().st_mode & 0o777, 0o600)
+
+        # 7. `run_cold_review` reviews untracked files, fails closed on bad `--base`, and fails without `[VERDICT: PASS]`
+        (self.repo / "brand_new_untracked.py").write_text("SECRET = 1\n", encoding="utf-8")
+        rev_no_verdict = run_cold_review(
+            repo_dir=self.repo,
+            home_dir=self.home,
+            custom_reviewer_cmd=[sys.executable, "-c", "import sys; d = sys.stdin.read(); assert 'brand_new_untracked.py' in d; print('truncated output')"],
+        )
+        self.assertEqual(rev_no_verdict["status"], "failed")
+        self.assertNotEqual(rev_no_verdict["exit_code"], 0)
+        with self.assertRaises(RuntimeError):
+            run_cold_review(repo_dir=self.repo, base_branch="nonexistent-branch-xyz", home_dir=self.home)
 
 
 if __name__ == "__main__":

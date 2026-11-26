@@ -63,7 +63,7 @@ echo "==> [3/4] 运行本机 PAOS Doctor 真机体检..."
 
 echo ""
 echo "==> [4/4] 扫描本机五大客户端 Cross-Harness 技能矩阵..."
-"$PAOS_BIN" matrix || true
+"$PAOS_BIN" matrix
 
 echo ""
 echo "部署完成！建议将 paos 加入 PATH："

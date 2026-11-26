@@ -1,43 +1,49 @@
-# 架构设计：三层确定性工程（Architecture）
+# 架构设计：五大确定性内核子系统（PAOS v0.1.0 Architecture）
 
-`minimal-personal-agent-os`（CLI 名为 `paos`）的核心主张只有一句话：**不要把概率大模型当操作系统本身，而是用确定性的文件状态、按需工具加载与物理隔离护栏，把大模型约束成一个可替换的执行部件。**
+`minimal-personal-agent-os`（CLI: `paos`）的核心设计哲学只有一句话：**不要把概率大模型当操作系统本身，而是用零外部依赖的确定性内核原语（包管理、记忆总线、双端门禁、隔离进程调度与原生定时中断），把多厂商 Agent 约束成可随时热插拔的计算部件。**
 
-## 1. 控制面与数据面分离（Control Plane vs. Data Plane）
+---
 
-大多数个人 AI 模板失败的原因，是把所有笔记、代码仓库、个人账单和安全脚本塞进同一个 Agent 可写目录：
-- 一旦目录结构跟用户现有 Obsidian / 代码仓冲突，3 天必弃坑；
-- 一旦 Agent 拥有控制面写权限，被提示词注入后可直接改写 `settings.json` 或删除拦截钩子。
+## 1. 控制面、共享大脑与业务工作区三层物理分离
 
-PAOS 强制拆成三个物理边界：
-1. **不可变护栏区（`~/.claude/hooks/` & `~/.claude/settings.json`）**：部署在工作区外部，并通过 `sandbox.filesystem.denyWrite` 与 `permissions.deny` 双重锁死只读，Agent 无权自改。
-2. **轻量控制面仓（`~/personal-harness/`）**：仅存放 `CLAUDE.md`、`USER.md`、`AGENTS.md`、记忆索引与自定义命令，纯文本 Git 托管，零隐私凭据。
-3. **外部业务工作区（Obsidian / 代码仓）**：按最小权限挂载，高敏目录（财务、主账号私钥、生产配置）物理隔离在外。
+1. **不可变护栏与审计区（`~/.claude/hooks/`、`~/.codex/rules/`、`~/.paos/logs/`）**
+   - 部署在业务代码仓之外，通过 `sandbox.filesystem.denyWrite` 与 `permissions.deny` 双重锁死只读，防止 Agent 被提示词注入后篡改门禁。
+   - 所有命令拦截（`gate_block`）、验证熔断（`stuck_cap`）、任务调度（`task_run`）与盲审结论（`code_review`）统一经 `lib/paos/audit.py` 正则脱敏后追加写入 `~/.paos/logs/audit.jsonl`（超 5MB 自动轮转）。
+2. **跨端统一真源层（`~/.paos/`）**
+   - `~/.paos/store/skills/`：全机唯一物理技能真源仓，根治跨客户端二级软链连环暴毙；
+   - `~/.paos/brain/`：跨客户端共享的核心契约（`CORE_RULES.md`、`USER.md`）与纯文本记忆层（`MEMORY.md` ≤200 行硬上限、`TODAY.md`、`INBOX.md`、`learnings.md`）。
+3. **外部业务数据面（代码仓 / 笔记库）**
+   - 按最小权限挂载；后台派发重任务时通过 `paos run --worktree` 在 `~/.paos/worktrees/` 自动拉起隔离 Git Worktree，杜绝踩脏主分支工作树。
 
-## 2. 记忆与 Prompt Cache 保护机制
+---
 
-- **静态契约置顶**：`CLAUDE.md` 仅通过 `@USER.md`、`@AGENTS.md`、`@memory/MEMORY.md` 引入低频变动的静态文本，最大化命中大模型的 **Prompt Cache**。
-- **200 行硬上限索引**：`memory/MEMORY.md` 严守 ≤200 行 / 25KB，只存 `1 行 1 指针`，正文下沉到 `memory/topics/*.md` 按需读取，`paos doctor` 会自动巡检所有项目的截断风险。
-- **动态状态后置注入**：每日变化的 `TODAY.md`、`INBOX.md` 计数和今昨两日日志通过项目级 `SessionStart` 钩子（`hooks/load_recent_memory.py`）动态输出到会话上下文（硬限流 ≤3,800 字符），不污染静态规则文件。
+## 2. 非破坏性跨端记忆编译器（`lib/paos/sync_bus.py`）
 
-## 3. 渐进式披露与「技能坟场」机制
+不同客户端对全局指令的加载协议各异：Claude Code 支持 `@~/.paos/brain/...` 按需引用，而 Codex（`~/.codex/AGENTS.md`）、Antigravity（`~/.gemini/GEMINI.md`）与 Cursor（`~/.cursor/rules/paos-shared.mdc`）直接内联读取 Markdown / MDC。
 
-- Claude Code 启动时会扫描 `~/.claude/skills/` 注入所有技能元数据；界面开关若未移除磁盘软链接，仍会持续消耗数千至上万启动 Token。
-- `paos skills` 通过物理目录切换（`~/.claude/skills/` ↔ `~/.claude/skills-off/`）配合 `config/skill-profiles.json` 场景预设（`minimal` / `writing` / `coding` / `video`），让你按当前工作模式在 0.1 秒内切换常驻技能集。
+`paos sync` 采用**受管标记块（`<!-- PAOS:BEGIN --> ... <!-- PAOS:END -->`）**编译协议：
+- **100% 保护用户手写配置**：受管块外部的任何原有指令（如 Codex 的 `@RTK.md` 或 Antigravity 的个人全局规则）原封不动保留；
+- **首次触碰强制备份**：首次向已有规则文件注入受管块前，自动完整备份原文件至 `~/.paos/backups/sync-<timestamp>/`；
+- **Prompt Cache 友好**：`SessionStart` 钩子 `hooks/load_recent_memory.py` 负责动态注入每日聚焦与日志（硬限流 ≤3,800 字符），当项目无本地 `memory/` 时自动回退读取 `~/.paos/brain/memory/`，避免高频改动静态规则文件击穿缓存。
 
-## 4. 跨客户端兼容映射
+---
 
-| 层级 | Claude Code | OpenAI Codex CLI | OpenClaw / 常驻网关 |
-| :--- | :--- | :--- | :--- |
-| 自动入口 | `CLAUDE.md` (`@import`) | `AGENTS.md` | `SOUL.md` + `USER.md` + `AGENTS.md` |
-| 每日命令 | `.claude/commands/{triage,reflect,promote}.md` | 直接读取同目录 Markdown 执行 | 映射为 Gateway 快捷指令 |
-| 技能规范 | `.claude/skills/<name>/SKILL.md` | `~/.codex/skills/<name>/SKILL.md` | ClawHub / 本地 `skills/` |
-| 安全门禁 | `~/.claude/settings.json` + `pre_tool_gate.py` | `~/.codex/rules/paos-guardrails.rules` (Starlark) | 宿主机容器隔离 + 网络代理 |
-| 定时巡检 | `hooks/heartbeat-run.sh` (`claude -p`) | `codex exec` 替换同脚本命令 | 原生 `HEARTBEAT.md` 守护进程 |
+## 3. 一级真源包管理与 `nvm` 式切档（`lib/paos/harnesses.py`）
 
-## 5. v0.2 跨客户端一级真源与 `nvm` 式切档架构
+1. **`paos adopt`**：扫描五大槽位，按最新 `SKILL.md` 修改时间择优收归独立实体目录至 `~/.paos/store/skills/`（外部 Git 仓库技能保持原位软链不搬家，同名分叉版本自动备份至 `~/.paos/backups/`），将五端全部改写为**一级直连软链**并保存快照。
+2. **`paos use <profile> [-p]`**：基于 `config/skill-profiles.json` 在 50ms 内同步切换五端技能软链与 Antigravity 插件包（`~/.gemini/config/config.json`），当场输出各端 Token 启动税增减账单。
+3. **`paos clean --prune-claude-state`**：清理 `.tmp-*` 崩溃残留文件、治愈二级断链，并在自动备份后原子剔除 `~/.claude.json` 中磁盘路径已不存在的失效项目缓存（沙盒受限路径采用 Fail-Safe 保守保留策略）。
 
-重度多工具用户本机同时存在 `~/.claude/skills`、`~/.codex/skills`、`~/.agents/skills`、`~/.gemini/antigravity-cli/skills` 与 `~/.cursor/skills` 五套槽位。传统安装器常建立跨客户端二级软链（如 `cursor -> .claude/skills/foo`），导致单端停用某技能时引发其他客户端大面积断链。
+---
 
-`paos` v0.2 引入两层解耦设计：
-1. **单一物理真源索引（`~/.paos/store/skills/`）**：`paos adopt` 将独立实体目录收归真源仓（外部 Git 仓库技能保持原位软链不搬移；内容分叉副本自动备份至 `~/.paos/backups/`），将五端全部改写为**一级直连软链**，并落盘 `~/.paos/snapshots/` 快照支持 `paos restore-links` 一键无损还原。
-2. **多端同步 `paos use <profile>`**：像 `nvm use` 切换 Node 版本一样，按 `minimal` / `writing` / `coding` / `video` / `lark` / `all` 预设在 50ms 内同步改写各目标客户端的一级挂载软链，彻底终结二级断链与多端上下文税失控。
+## 4. 受控进程调度与金鱼零记忆盲审（`lib/paos/scheduler.py`）
+
+- **`paos run`**：屏蔽 `claude -p`、`codex exec` 与 `agy -p` 的底层 CLI 参数差异，统一提供 `--worktree` 物理分支隔离、`start_new_session=True` + `os.killpg` 整棵子进程树超时强杀（终结孤儿测试进程挂死）以及预算/轮次硬上限。若隔离 Worktree 无任何文件改动与新提交，任务结束后自动无痕回收。
+- **`paos review`（Goldfish Cold-Start Gate）**：严格践行「写审分离」——开启全新零上下文子进程，**仅投喂纯 Git Diff 与 P0/P1 两级审查标尺**，绝不喂入原会话的妥协借口；一旦检出可复现的 `[P0]` 阻断级缺陷（算错钱、丢数据、越权、密钥泄露、死循环或崩溃），立即返回退出码 `2` 阻断合并流水线。
+
+---
+
+## 5. 零守护进程定时巡检与单向脱敏通知（`lib/paos/cron.py` & `notify.py`）
+
+- **向 OS 借原生调度器**：拒绝为每天跑 1 分钟的定时巡检维护 24 小时常驻 Python/Node Daemon。`paos cron install` 在 macOS 上用标准库 `plistlib` 生成合法 `~/Library/LaunchAgents/com.paos.<job>.plist`，在 Linux 上幂等写入带 `# PAOS-CRON:<job>` 标签的 `crontab`，执行时通过 `/tmp` 原子目录锁防止重叠并发。
+- **零入站端口单向通知总线**：`paos notify` 仅发起纯出站 HTTPS / 本地 `osascript` 调用（无需公网 IP、无需内网穿透、零入站监听端口），且所有标题与正文在出站前强制经过 `redact_secrets()` 脱敏清洗。

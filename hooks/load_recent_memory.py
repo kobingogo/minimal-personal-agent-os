@@ -3,7 +3,8 @@
 
 Injects a compact operational snapshot (<= 3,800 chars, well below Claude Code's
 10,000-char SessionStart truncation limit) without mutating static CLAUDE.md
-(preserving Prompt Cache).
+(preserving Prompt Cache). Falls back to `~/.paos/brain/memory/` when the current
+workspace does not contain a local `memory/` directory.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import sys
 
 MAX_OUTPUT_CHARS = 3800
 TAG_RE = re.compile(r"\[tag:([a-zA-Z0-9_-]+)\]")
+PROMOTED_RE = re.compile(r"\[promoted:")
 
 
 def read_lines_safe(path: Path) -> list[str]:
@@ -28,12 +30,18 @@ def read_lines_safe(path: Path) -> list[str]:
         return []
 
 
-def build_snapshot(root: Path, today: date | None = None) -> str:
+def build_snapshot(root: Path, today: date | None = None, home_dir: Path | None = None) -> str:
     today = today or date.today()
     yesterday = today - timedelta(days=1)
+    home = home_dir or Path(os.environ.get("PAOS_HOME_DIR") or Path.home())
+
     mem_dir = root / "memory"
     if not mem_dir.is_dir():
-        return ""
+        shared_mem = Path(home) / ".paos" / "brain" / "memory"
+        if shared_mem.is_dir():
+            mem_dir = shared_mem
+        else:
+            return ""
 
     out: list[str] = [f"=== Personal OS 开机状态 ({today.isoformat()}) ==="]
 
@@ -56,12 +64,14 @@ def build_snapshot(root: Path, today: date | None = None) -> str:
             out.append(f"--- 每日日志 ({d_str}) ---")
             out.extend(daily_lines[-20:])
 
-    # 4. Recurring learnings ready for promotion
-    learn_text = "\n".join(read_lines_safe(mem_dir / "learnings.md"))
-    tags = Counter(TAG_RE.findall(learn_text))
+    # 4. Recurring unpromoted learnings ready for promotion
+    unpromoted_lines = [
+        l for l in read_lines_safe(mem_dir / "learnings.md") if not PROMOTED_RE.search(l)
+    ]
+    tags = Counter(TAG_RE.findall("\n".join(unpromoted_lines)))
     ready = [f"{t}({c}次)" for t, c in tags.most_common(5) if c >= 2]
     if ready:
-        out.append(f"--- 进化提醒：检测到复发纠偏标签 {', '.join(ready)}，周末可运行 /promote 审阅晋升 ---")
+        out.append(f"--- 进化提醒：检测到复发纠偏标签 {', '.join(ready)}，可运行 `paos promote` 审阅晋升 ---")
 
     joined = "\n".join(out)
     if len(joined) > MAX_OUTPUT_CHARS:

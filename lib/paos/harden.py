@@ -22,7 +22,7 @@ HOOK_FILES = (
 )
 
 REQUIRED_DENY_READ = ["~/.ssh/**", "~/.aws/**", "~/.config/gh/**", "**/.env*"]
-REQUIRED_DENY_WRITE = ["~/.claude/**"]
+REQUIRED_DENY_WRITE = ["~/.claude/**", "~/.codex/rules/**", "~/.paos/logs/**"]
 DEFAULT_ALLOWED_DOMAINS = [
     "github.com",
     "*.githubusercontent.com",
@@ -34,8 +34,18 @@ DEFAULT_ALLOWED_DOMAINS = [
 REQUIRED_PERMISSIONS_DENY = [
     "Read(.env)",
     "Read(.env.*)",
+    "Read(**/.env)",
+    "Read(**/.env.*)",
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(~/.config/gh/**)",
+    "Read(~/.paos/config.json)",
     "Write(~/.claude/**)",
     "Edit(~/.claude/**)",
+    "Write(~/.codex/rules/**)",
+    "Edit(~/.codex/rules/**)",
+    "Write(~/.paos/logs/**)",
+    "Edit(~/.paos/logs/**)",
 ]
 GATE_COMMAND = "~/.claude/hooks/pre_tool_gate.py"
 
@@ -106,7 +116,7 @@ def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
     if not already_wired:
         pre_list.append(
             {
-                "matcher": "Bash|Write|Edit",
+                "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
                 "hooks": [
                     {
                         "type": "command",
@@ -224,7 +234,11 @@ def apply_harden(
     if settings_path.is_file():
         current_text = settings_path.read_text(encoding="utf-8")
         if current_text.strip():
-            current_obj = json.loads(current_text)
+            try:
+                parsed = json.loads(current_text)
+                current_obj = parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{settings_path} JSON 语法损坏，拒绝覆盖: {exc}") from exc
 
     merged_obj = merge_claude_settings(current_obj)
     new_text = json.dumps(merged_obj, ensure_ascii=False, indent=2) + "\n"
@@ -257,6 +271,10 @@ def apply_harden(
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             backup_path = backups_dir / f"settings-{ts}.json.bak"
             shutil.copy2(settings_path, backup_path)
+        elif not settings_path.is_file():
+            backups_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            (backups_dir / f"settings-{ts}.empty.bak").write_text("", encoding="utf-8")
 
         if diff_lines or not settings_path.is_file():
             claude_dir.mkdir(parents=True, exist_ok=True)
@@ -341,17 +359,42 @@ def ensure_global_gitignore(home: Path) -> Path:
     return home / ".gitignore_global"
 
 
-def rollback_settings(home_dir: Path | None = None) -> Tuple[bool, str]:
+def rollback_settings(home_dir: Path | None = None, include_codex: bool = False) -> Tuple[bool, str]:
     home = home_dir or Path.home()
+    msgs: List[str] = []
+    any_ok = False
+
     backups_dir = home / ".claude" / "backups"
     settings_path = home / ".claude" / "settings.json"
-    if not backups_dir.is_dir():
-        return (False, "未找到备份目录 ~/.claude/backups/。")
+    candidates = sorted(backups_dir.glob("settings-*.json.bak")) if backups_dir.is_dir() else []
+    empty_sentinels = sorted(backups_dir.glob("settings-*.empty.bak")) if backups_dir.is_dir() else []
+    if candidates:
+        latest = candidates[-1]
+        shutil.copy2(latest, settings_path)
+        msgs.append(f"[Claude] 已从 {latest} 恢复 {settings_path}")
+        any_ok = True
+    elif empty_sentinels and settings_path.is_file():
+        settings_path.unlink()
+        msgs.append(f"[Claude] 已移除首次生成的配置文件 {settings_path}")
+        any_ok = True
+    else:
+        msgs.append("[Claude] 未找到可回滚的 settings 备份文件。")
 
-    candidates = sorted(backups_dir.glob("settings-*.json.bak"))
-    if not candidates:
-        return (False, "未找到任何可回滚的 settings 备份文件。")
+    if include_codex:
+        codex_bak_dir = home / ".codex" / "backups"
+        codex_rules_path = home / ".codex" / "rules" / "paos-guardrails.rules"
+        codex_baks = sorted(codex_bak_dir.glob("paos-guardrails-*.rules.bak")) if codex_bak_dir.is_dir() else []
+        if codex_baks:
+            latest_c = codex_baks[-1]
+            codex_rules_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(latest_c, codex_rules_path)
+            msgs.append(f"[Codex] 已从 {latest_c} 恢复 {codex_rules_path}")
+            any_ok = True
+        elif codex_rules_path.is_file():
+            codex_rules_path.unlink()
+            msgs.append(f"[Codex] 已移除首次生成的门禁规则 {codex_rules_path}")
+            any_ok = True
+        else:
+            msgs.append("[Codex] 未找到可回滚的 paos-guardrails.rules 备份或规则文件。")
 
-    latest = candidates[-1]
-    shutil.copy2(latest, settings_path)
-    return (True, f"已从 {latest} 恢复 {settings_path}")
+    return (any_ok, "\n".join(msgs))

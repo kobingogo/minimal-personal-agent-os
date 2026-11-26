@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import subprocess
+import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .skills import FRONTMATTER_RE, _parse_skill_meta
@@ -76,7 +78,8 @@ def resolve_targets(targets_arg: Optional[str], home: Path, only_installed: bool
     installed: List[str] = []
     for hid in HARNESS_ORDER:
         spec = HARNESS_SPECS[hid]
-        if (home / spec["root"]).exists() or (home / spec["skills"]).exists():
+        has_alt = hid == "antigravity" and (home / ".gemini").exists()
+        if (home / spec["root"]).exists() or (home / spec["skills"]).exists() or has_alt:
             installed.append(hid)
     return installed
 
@@ -294,6 +297,7 @@ def scan_matrix(home_dir: Optional[Path] = None) -> Dict[str, Any]:
         "store_skill_count": store_count,
         "unique_known_skills": len(unique_known_skills),
         "totals": {
+            "active_entries_across_harnesses": sum(h["active_count"] for h in harnesses_report),
             "estimated_tokens_across_harnesses": total_active_tokens,
             "estimated_agy_plugin_tokens": agy_plugins["enabled_tokens"],
             "broken_symlinks": total_broken,
@@ -406,7 +410,8 @@ def set_agy_plugins_state(
     missing: List[str] = []
 
     agy_bin = shutil.which("agy") or str(home / ".local" / "bin" / "agy")
-    use_cli = (home == Path.home().resolve()) and Path(agy_bin).is_file()
+    real_pw_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    use_cli = (home == real_pw_home) and Path(agy_bin).is_file()
 
     for name in plugin_names:
         if name not in known:
@@ -416,15 +421,30 @@ def set_agy_plugins_state(
             continue
         changed.append(name)
         if not dry_run:
+            wrote_via_cli = False
             if use_cli:
                 verb = "enable" if enabled else "disable"
-                subprocess.run([agy_bin, "plugin", verb, name], check=True, capture_output=True, text=True)
-            else:
+                try:
+                    subprocess.run(
+                        [agy_bin, "plugin", verb, name],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    wrote_via_cli = True
+                except (OSError, subprocess.SubprocessError):
+                    wrote_via_cli = False
+            if not wrote_via_cli:
                 cfg_path = home / ".gemini" / "config" / "config.json"
                 cfg_path.parent.mkdir(parents=True, exist_ok=True)
                 data = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
                 pmap = data.setdefault("plugins", {})
-                pmap[name] = {"enabled": enabled}
+                existing_entry = pmap.get(name)
+                if isinstance(existing_entry, dict):
+                    existing_entry["enabled"] = enabled
+                else:
+                    pmap[name] = {"enabled": enabled}
                 cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     saved_tokens = sum(known[n]["estimated_tokens"] for n in changed) * (-1 if not enabled else 1)
@@ -479,7 +499,7 @@ def adopt_skills(
                     if name not in newest_phys or mt > newest_phys[name][0]:
                         newest_phys[name] = (mt, entry)
 
-    # Pass 1: Snapshot & populate canonical store `~/.paos/store/skills/<name>`
+    # Pass 0: Pure read-only snapshot BEFORE any filesystem moves/symlinks mutate downstream harnesses!
     for hid in target_ids:
         spec = HARNESS_SPECS[hid]
         for slot_kind, rel_dir in (("active", spec["skills"]), ("off", spec["off"])):
@@ -501,6 +521,19 @@ def adopt_skills(
                     }
                 )
 
+    # Pass 1: Populate canonical store `~/.paos/store/skills/<name>`
+    for hid in target_ids:
+        spec = HARNESS_SPECS[hid]
+        for slot_kind, rel_dir in (("active", spec["skills"]), ("off", spec["off"])):
+            base = home / rel_dir
+            if not base.is_dir():
+                continue
+            for name in sorted(os.listdir(base)):
+                if name.startswith(".") or name.startswith("_"):
+                    continue
+                entry = base / name
+                is_link = entry.is_symlink()
+
                 canonical = store_dir / name
                 already_has_canon = canonical.exists() or canonical.is_symlink() or (name in adopted_source)
                 if is_link:
@@ -519,6 +552,8 @@ def adopt_skills(
                             adopted_source[name] = real_target
                             if not dry_run:
                                 shutil.move(str(real_target), str(canonical))
+                                # Leave a 1-hop symlink at `real_target` so the downstream harness keeps its entry!
+                                os.symlink(str(canonical), str(real_target))
                 elif entry.is_dir():
                     preferred = newest_phys.get(name, (0.0, entry))[1]
                     if not already_has_canon and entry == preferred:
@@ -707,6 +742,7 @@ def use_profile(
     profiles_file: Path,
     home_dir: Optional[Path] = None,
     targets: Optional[Sequence[str]] = None,
+    include_plugins: bool = False,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """`nvm use` for AI Agent skills: switch active skills across all targeted harnesses in <50ms."""
@@ -727,6 +763,7 @@ def use_profile(
 
     store_dir = home / ".paos" / "store" / "skills"
     per_harness: List[Dict[str, Any]] = []
+    skipped_permissions: List[str] = []
 
     for hid in target_ids:
         spec = HARNESS_SPECS[hid]
@@ -757,40 +794,45 @@ def use_profile(
                         to_enable.append(name)
 
         if not dry_run:
-            sk_dir.mkdir(parents=True, exist_ok=True)
-            off_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                sk_dir.mkdir(parents=True, exist_ok=True)
+                off_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Park undesired entries safely
-            for name in to_park:
-                src = sk_dir / name
-                if not (src.exists() or src.is_symlink()):
-                    continue
-                # If already backed by `~/.paos/store/skills/<name>`, move symlink into `skills-off/`
-                dst = off_dir / name
-                if dst.exists() or dst.is_symlink():
-                    if dst.is_symlink() or dst.is_file():
-                        dst.unlink()
+                # 1. Park undesired entries safely (never delete a real physical dir when src is only a symlink!)
+                for name in to_park:
+                    src = sk_dir / name
+                    if not (src.exists() or src.is_symlink()):
+                        continue
+                    dst = off_dir / name
+                    if src.is_symlink() and dst.is_dir() and not dst.is_symlink():
+                        src.unlink()
                     else:
-                        shutil.rmtree(dst)
-                shutil.move(str(src), str(dst))
+                        if dst.exists() or dst.is_symlink():
+                            if dst.is_symlink() or dst.is_file():
+                                dst.unlink()
+                            else:
+                                shutil.rmtree(dst)
+                        shutil.move(str(src), str(dst))
 
-            # 2. Enable desired entries (preferring direct 1-hop symlink to store or canonical source)
-            for name in to_enable:
-                dst = sk_dir / name
-                if dst.is_symlink() and not dst.exists():
-                    dst.unlink()
-                if dst.exists():
-                    continue
-                off_cand = off_dir / name
-                store_cand = store_dir / name
-                if store_cand.exists() or store_cand.is_symlink():
-                    if off_cand.is_symlink():
-                        off_cand.unlink()
-                    os.symlink(str(store_cand), str(dst))
-                elif off_cand.exists():
-                    shutil.move(str(off_cand), str(dst))
-                elif name in pool:
-                    os.symlink(str(pool[name]), str(dst))
+                # 2. Enable desired entries (preferring intact 1-hop symlink to store or canonical source)
+                for name in to_enable:
+                    dst = sk_dir / name
+                    if dst.is_symlink() and not dst.exists():
+                        dst.unlink()
+                    if dst.exists():
+                        continue
+                    off_cand = off_dir / name
+                    store_cand = store_dir / name
+                    if store_cand.exists():
+                        if off_cand.is_symlink():
+                            off_cand.unlink()
+                        os.symlink(str(store_cand), str(dst))
+                    elif off_cand.exists():
+                        shutil.move(str(off_cand), str(dst))
+                    elif name in pool:
+                        os.symlink(str(pool[name]), str(dst))
+            except OSError as exc:
+                skipped_permissions.append(f"{hid}: {exc}")
 
         after_tokens = 0
         after_active_count = 0
@@ -824,6 +866,37 @@ def use_profile(
             }
         )
 
+    agy_plugin_result: Optional[Dict[str, Any]] = None
+    if include_plugins:
+        plg_info = scan_agy_plugins(home)
+        if plg_info["total_count"] > 0:
+            plg_patterns = list(cfg.get("always_keep_agy_plugins") or []) + list(
+                profiles[profile_name].get("agy_plugins") or []
+            )
+            want_en: List[str] = []
+            want_dis: List[str] = []
+            for p in plg_info["plugins"]:
+                should_en = any(fnmatch.fnmatch(p["name"], pat) for pat in plg_patterns)
+                if should_en and not p["enabled"]:
+                    want_en.append(p["name"])
+                elif not should_en and p["enabled"]:
+                    want_dis.append(p["name"])
+            delta_plg = 0
+            try:
+                if want_en:
+                    r_en = set_agy_plugins_state(want_en, enabled=True, home_dir=home, dry_run=dry_run)
+                    delta_plg += r_en["delta_tokens"]
+                if want_dis:
+                    r_dis = set_agy_plugins_state(want_dis, enabled=False, home_dir=home, dry_run=dry_run)
+                    delta_plg += r_dis["delta_tokens"]
+            except (OSError, subprocess.SubprocessError) as exc:
+                skipped_permissions.append(f"agy_plugins: {exc}")
+            agy_plugin_result = {
+                "enabled": want_en,
+                "disabled": want_dis,
+                "delta_tokens": delta_plg,
+            }
+
     if not dry_run:
         paos_dir = home / ".paos"
         paos_dir.mkdir(parents=True, exist_ok=True)
@@ -849,6 +922,78 @@ def use_profile(
         "desired_skill_count": len(desired_names),
         "desired_skills": sorted(desired_names),
         "harnesses": per_harness,
+        "agy_plugins": agy_plugin_result,
+        "skipped_permissions": skipped_permissions,
+    }
+
+
+def prune_claude_state_json(home_dir: Optional[Path] = None, dry_run: bool = False) -> Dict[str, Any]:
+    """Safely prune stale deleted project caches from `~/.claude.json` with automatic backup."""
+    home = (home_dir or Path.home()).resolve()
+    cjson = home / ".claude.json"
+    if not cjson.is_file():
+        return {"pruned_projects": [], "reclaimed_bytes": 0, "backup_path": None}
+
+    try:
+        old_txt = cjson.read_text(encoding="utf-8")
+        data = json.loads(old_txt)
+    except Exception:
+        return {"pruned_projects": [], "reclaimed_bytes": 0, "backup_path": None}
+
+    projects = data.get("projects")
+    if not isinstance(projects, dict) or not projects:
+        return {"pruned_projects": [], "reclaimed_bytes": 0, "backup_path": None}
+
+    pruned: List[str] = []
+    kept_projects: Dict[str, Any] = {}
+    for proj_key, proj_val in projects.items():
+        # Preserve projects with non-empty project-scoped MCP server definitions
+        if isinstance(proj_val, dict) and proj_val.get("mcpServers"):
+            kept_projects[proj_key] = proj_val
+            continue
+        # Preserve projects on unmounted external drives (/Volumes/<vol>/...)
+        if proj_key.startswith("/Volumes/"):
+            vol_parts = Path(proj_key).parts
+            if len(vol_parts) >= 3 and not (Path("/Volumes") / vol_parts[2]).exists():
+                kept_projects[proj_key] = proj_val
+                continue
+        try:
+            exists = Path(proj_key).exists()
+        except OSError:
+            exists = True  # Fail-safe inside OS sandboxes: never prune un-stat-able paths
+        if exists:
+            kept_projects[proj_key] = proj_val
+        else:
+            pruned.append(proj_key)
+
+    if not pruned:
+        return {"pruned_projects": [], "reclaimed_bytes": 0, "backup_path": None}
+
+    new_data = dict(data)
+    new_data["projects"] = kept_projects
+    new_txt = json.dumps(new_data, ensure_ascii=False, indent=2) + "\n"
+    reclaimed = max(0, len(old_txt.encode("utf-8")) - len(new_txt.encode("utf-8")))
+    backup_path: Optional[str] = None
+
+    if not dry_run:
+        orig_mode = (cjson.stat().st_mode & 0o777) or 0o600
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        bdir = home / ".claude" / "backups"
+        bdir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        bp = bdir / f"claude-state-{ts}.json.bak"
+        shutil.copy2(cjson, bp)
+        os.chmod(bp, orig_mode)
+        backup_path = str(bp)
+
+        tmp_p = cjson.with_name(".claude.json.paos-tmp")
+        tmp_p.write_text(new_txt, encoding="utf-8")
+        os.chmod(tmp_p, orig_mode)
+        os.replace(tmp_p, cjson)
+
+    return {
+        "pruned_projects": pruned,
+        "reclaimed_bytes": reclaimed,
+        "backup_path": backup_path,
     }
 
 
@@ -856,9 +1001,11 @@ def clean_harnesses(
     home_dir: Optional[Path] = None,
     targets: Optional[Sequence[str]] = None,
     heal_links: bool = True,
+    prune_claude_state: bool = False,
+    min_tmp_age_sec: int = 0,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Safely clean orphan `.tmp-*` crash files, `.DS_Store`, and heal/quarantine broken symlinks."""
+    """Safely clean orphan `.tmp-*` crash files, `.DS_Store`, stale `.claude.json` projects, and broken symlinks."""
     home = (home_dir or Path.home()).resolve()
     target_ids = list(targets) if targets else resolve_targets(None, home, only_installed=True)
 
@@ -866,6 +1013,8 @@ def clean_harnesses(
     reclaimed_bytes = 0
     healed_symlinks: List[str] = []
     quarantined_symlinks: List[str] = []
+    skipped_permissions: List[str] = []
+    now_ts = time.time()
 
     for hid in target_ids:
         spec = HARNESS_SPECS[hid]
@@ -877,13 +1026,20 @@ def clean_harnesses(
             for match in sorted(home.glob(pat)):
                 if match.is_file() or match.is_symlink():
                     try:
-                        sz = match.lstat().st_size
+                        st = match.lstat()
+                        if min_tmp_age_sec > 0 and (now_ts - st.st_mtime) < min_tmp_age_sec:
+                            continue
+                        sz = st.st_size
                     except OSError:
                         sz = 0
+                    if not dry_run:
+                        try:
+                            match.unlink()
+                        except OSError as exc:
+                            skipped_permissions.append(f"{match}: {exc}")
+                            continue
                     removed_orphans.append(str(match.relative_to(home)))
                     reclaimed_bytes += sz
-                    if not dry_run:
-                        match.unlink()
 
         # 2. `.DS_Store` & broken symlinks in `<harness>/skills`
         if sk_dir.is_dir():
@@ -891,12 +1047,17 @@ def clean_harnesses(
                 entry = sk_dir / name
                 if name == ".DS_Store" and entry.is_file():
                     try:
-                        reclaimed_bytes += entry.stat().st_size
+                        sz = entry.stat().st_size
                     except OSError:
-                        pass
-                    removed_orphans.append(str(entry.relative_to(home)))
+                        sz = 0
                     if not dry_run:
-                        entry.unlink()
+                        try:
+                            entry.unlink()
+                        except OSError as exc:
+                            skipped_permissions.append(f"{entry}: {exc}")
+                            continue
+                    reclaimed_bytes += sz
+                    removed_orphans.append(str(entry.relative_to(home)))
                     continue
 
                 if name.startswith("."):
@@ -905,19 +1066,35 @@ def clean_harnesses(
                 if entry.is_symlink() and not entry.exists():
                     cand = _find_heal_candidate(name, home) if heal_links else None
                     if cand is not None:
+                        if not dry_run:
+                            try:
+                                entry.unlink()
+                                os.symlink(str(cand), str(entry))
+                            except OSError as exc:
+                                skipped_permissions.append(f"{entry}: {exc}")
+                                continue
                         healed_symlinks.append(f"{hid}:{name} -> {cand}")
-                        if not dry_run:
-                            entry.unlink()
-                            os.symlink(str(cand), str(entry))
                     else:
-                        quarantined_symlinks.append(f"{hid}:{name}")
                         if not dry_run:
-                            q_dir = off_dir / "_broken"
-                            q_dir.mkdir(parents=True, exist_ok=True)
-                            q_dst = q_dir / name
-                            if q_dst.exists() or q_dst.is_symlink():
-                                q_dst.unlink()
-                            shutil.move(str(entry), str(q_dst))
+                            try:
+                                q_dir = off_dir / "_broken"
+                                q_dir.mkdir(parents=True, exist_ok=True)
+                                q_dst = q_dir / name
+                                if q_dst.exists() or q_dst.is_symlink():
+                                    q_dst.unlink()
+                                shutil.move(str(entry), str(q_dst))
+                            except OSError as exc:
+                                skipped_permissions.append(f"{entry}: {exc}")
+                                continue
+                        quarantined_symlinks.append(f"{hid}:{name}")
+
+    prune_res: Dict[str, Any] = {"pruned_projects": [], "reclaimed_bytes": 0, "backup_path": None}
+    if prune_claude_state:
+        try:
+            prune_res = prune_claude_state_json(home, dry_run=dry_run)
+            reclaimed_bytes += prune_res["reclaimed_bytes"]
+        except OSError as exc:
+            skipped_permissions.append(f".claude.json: {exc}")
 
     return {
         "dry_run": dry_run,
@@ -926,4 +1103,7 @@ def clean_harnesses(
         "reclaimed_bytes": reclaimed_bytes,
         "healed_symlinks": healed_symlinks,
         "quarantined_broken_symlinks": quarantined_symlinks,
+        "pruned_claude_projects": prune_res["pruned_projects"],
+        "claude_state_backup": prune_res["backup_path"],
+        "skipped_permissions": skipped_permissions,
     }

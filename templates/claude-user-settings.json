@@ -4,8 +4,17 @@
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
     "filesystem": {
-      "denyRead": ["~/.ssh/**", "~/.aws/**", "~/.config/gh/**", "**/.env*"],
-      "denyWrite": ["~/.claude/**"]
+      "denyRead": [
+        "~/.ssh/**",
+        "~/.aws/**",
+        "~/.config/gh/**",
+        "**/.env*"
+      ],
+      "denyWrite": [
+        "~/.claude/**",
+        "~/.codex/rules/**",
+        "~/.paos/logs/**"
+      ]
     },
     "network": {
       "allowedDomains": [
@@ -22,14 +31,24 @@
     "deny": [
       "Read(.env)",
       "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.paos/config.json)",
       "Write(~/.claude/**)",
-      "Edit(~/.claude/**)"
+      "Edit(~/.claude/**)",
+      "Write(~/.codex/rules/**)",
+      "Edit(~/.codex/rules/**)",
+      "Write(~/.paos/logs/**)",
+      "Edit(~/.paos/logs/**)"
     ]
   },
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit",
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",
