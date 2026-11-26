@@ -18,7 +18,9 @@ from .harnesses import (
     clean_harnesses,
     resolve_targets,
     restore_links,
+    scan_agy_plugins,
     scan_matrix,
+    set_agy_plugins_state,
     use_profile,
 )
 from .skills import (
@@ -69,9 +71,18 @@ def cmd_matrix(args: argparse.Namespace) -> int:
     t = rep["totals"]
     print("  " + "-" * (len(header) - 2))
     print(
-        f"  跨端累计预估启动税: ~{t['estimated_tokens_across_harnesses']:,} Token | "
-        f"失效软链: {t['broken_symlinks']} 个 | 脆弱二级软链: {t['daisy_chain_symlinks']} 个"
+        f"  跨端技能目录启动税: ~{t['estimated_tokens_across_harnesses']:,} Token | "
+        f"Antigravity 插件包税: ~{t.get('estimated_agy_plugin_tokens', 0):,} Token | "
+        f"失效软链: {t['broken_symlinks']} 个"
     )
+
+    agp = rep.get("agy_plugins")
+    if agp and agp["total_count"] > 0:
+        heavy = [p for p in agp["plugins"] if p["enabled"] and p["estimated_tokens"] >= 1000]
+        if heavy:
+            h_desc = ", ".join(f"{p['name']}(~{p['estimated_tokens']:,} tok)" for p in heavy)
+            print(f"  [!] Antigravity 常驻重型插件 ({agp['enabled_count']}/{agp['total_count']} 启用): {h_desc}")
+            print("      -> 可运行 `paos plugins list` 或 `paos plugins disable <name>` 按需瘦身")
 
     # Actionable highlights
     for h in rep["harnesses"]:
@@ -180,6 +191,37 @@ def cmd_clean(args: argparse.Namespace) -> int:
     for q in res["quarantined_broken_symlinks"]:
         print(f"    ~ {q}")
     return 0
+
+
+def cmd_plugins(args: argparse.Namespace) -> int:
+    sub = args.plugins_cmd
+    if sub == "list":
+        info = scan_agy_plugins()
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            return 0
+        print(
+            f"=== Antigravity 插件包启动税账单 ({info['enabled_count']}/{info['total_count']} 启用, 累计 ~{info['enabled_tokens']:,} Token) ==="
+        )
+        for p in info["plugins"]:
+            st = "ENABLED " if p["enabled"] else "disabled"
+            mcp_tag = " + MCP" if p["has_mcp"] else ""
+            print(
+                f"  [{st}] {p['name']:<26} | {p['skill_count']:>2} skills, {p['rule_count']} rules{mcp_tag:<6} | ~{p['estimated_tokens']:,} tok"
+            )
+        return 0
+
+    enable_flag = sub == "enable"
+    res = set_agy_plugins_state(args.names, enabled=enable_flag, dry_run=args.dry_run)
+    action = "启用" if enable_flag else "停用"
+    mode = "(--dry-run 预览)" if args.dry_run else "(已写入配置，新开会话生效)"
+    sign = "+" if res["delta_tokens"] > 0 else ""
+    print(
+        f"=== Antigravity 插件{action} {mode}: {', '.join(res['changed']) or '无变更'} (启动税变化 {sign}{res['delta_tokens']:,} tok) ==="
+    )
+    if res["missing"]:
+        print(f"  未找到插件: {', '.join(res['missing'])}", file=sys.stderr)
+    return 0 if not res["missing"] else 1
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -425,6 +467,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_cln.add_argument("--no-heal", action="store_true", help="仅隔离失效软链，不尝试从真源自动修复")
     p_cln.add_argument("--dry-run", action="store_true", help="仅预览待清理文件与修复项，不落盘")
     p_cln.set_defaults(func=cmd_clean)
+
+    p_plg = sub.add_parser("plugins", help="查看与按需启停 Antigravity (`~/.gemini/config/plugins/`) 插件包税")
+    plg_sub = p_plg.add_subparsers(dest="plugins_cmd", required=True)
+    p_plg_ls = plg_sub.add_parser("list", help="列出各插件包含的 Skill/Rule/MCP 数量与预估启动 Token 税")
+    p_plg_ls.add_argument("--json", action="store_true")
+    p_plg_dis = plg_sub.add_parser("disable", help="按需停用低频领域插件（如 genomics chemistry firebase），保留安装不删除")
+    p_plg_dis.add_argument("names", nargs="+", help="插件目录名")
+    p_plg_dis.add_argument("--dry-run", action="store_true")
+    p_plg_en = plg_sub.add_parser("enable", help="随时重新启用指定插件")
+    p_plg_en.add_argument("names", nargs="+", help="插件目录名")
+    p_plg_en.add_argument("--dry-run", action="store_true")
+    p_plg.set_defaults(func=cmd_plugins)
 
     # Core v0.1 Commands (100% preserved & enhanced)
     p_doc = sub.add_parser("doctor", help="执行 5 维本机上下文膨胀与安全护栏真机体检")

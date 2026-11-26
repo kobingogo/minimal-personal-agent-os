@@ -27,7 +27,9 @@ from paos.harnesses import (  # noqa: E402
     adopt_skills,
     clean_harnesses,
     restore_links,
+    scan_agy_plugins,
     scan_matrix,
+    set_agy_plugins_state,
     use_profile,
 )
 from paos.skills import (  # noqa: E402
@@ -401,6 +403,26 @@ class TestCrossHarnessControlPlaneV02(unittest.TestCase):
         # 6. `restore_links` restores pre-adopt snapshot cleanly
         ok, msg = restore_links(self.home)
         self.assertTrue(ok, msg)
+
+    def test_agy_plugin_bundle_accounting_and_toggle(self) -> None:
+        pdir = self.home / ".gemini" / "config" / "plugins" / "genomics"
+        (pdir / "skills" / "s1").mkdir(parents=True)
+        (pdir / "plugin.json").write_text('{"name":"genomics"}\n', encoding="utf-8")
+        (pdir / "skills" / "s1" / "SKILL.md").write_text(
+            "---\nname: s1\ndescription: heavy genomics skill\n---\n", encoding="utf-8"
+        )
+
+        before = scan_agy_plugins(self.home)
+        self.assertEqual(before["enabled_count"], 1)
+        self.assertGreater(before["enabled_tokens"], 30)
+
+        res = set_agy_plugins_state(["genomics"], enabled=False, home_dir=self.home)
+        self.assertEqual(res["changed"], ["genomics"])
+        self.assertLess(res["delta_tokens"], 0)
+
+        after = scan_agy_plugins(self.home)
+        self.assertEqual(after["enabled_count"], 0)
+        self.assertEqual(after["disabled_count"], 1)
 
 
 if __name__ == "__main__":

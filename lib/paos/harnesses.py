@@ -9,9 +9,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from .skills import _parse_skill_meta
+from .skills import FRONTMATTER_RE, _parse_skill_meta
 
 HARNESS_ORDER: Tuple[str, ...] = ("claude", "codex", "agents", "antigravity", "cursor")
 
@@ -285,6 +286,8 @@ def scan_matrix(home_dir: Optional[Path] = None) -> Dict[str, Any]:
         except Exception:
             current_profile = None
 
+    agy_plugins = scan_agy_plugins(home)
+
     return {
         "active_profile": current_profile,
         "store_dir": "~/.paos/store/skills",
@@ -292,6 +295,7 @@ def scan_matrix(home_dir: Optional[Path] = None) -> Dict[str, Any]:
         "unique_known_skills": len(unique_known_skills),
         "totals": {
             "estimated_tokens_across_harnesses": total_active_tokens,
+            "estimated_agy_plugin_tokens": agy_plugins["enabled_tokens"],
             "broken_symlinks": total_broken,
             "daisy_chain_symlinks": total_daisy,
             "duplicate_physical_skills": len(duplicates),
@@ -300,7 +304,136 @@ def scan_matrix(home_dir: Optional[Path] = None) -> Dict[str, Any]:
             "orphan_temp_bytes": total_orphan_bytes,
         },
         "harnesses": harnesses_report,
+        "agy_plugins": agy_plugins,
         "duplicates": duplicates,
+    }
+
+
+def scan_agy_plugins(home_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Inspect Antigravity plugin bundles in `~/.gemini/config/plugins/` & enabled state."""
+    home = (home_dir or Path.home()).resolve()
+    plugins_dir = home / ".gemini" / "config" / "plugins"
+    config_json = home / ".gemini" / "config" / "config.json"
+
+    cfg_plugins: Dict[str, Any] = {}
+    if config_json.is_file():
+        try:
+            cfg_plugins = (json.loads(config_json.read_text(encoding="utf-8")).get("plugins") or {})
+        except PermissionError:
+            cfg_plugins = {}
+        except Exception:
+            cfg_plugins = {}
+
+    items: List[Dict[str, Any]] = []
+    enabled_tokens = 0
+    disabled_tokens = 0
+
+    if plugins_dir.is_dir():
+        try:
+            entries = sorted(os.listdir(plugins_dir))
+        except PermissionError:
+            entries = []
+        for name in entries:
+            if name.startswith("."):
+                continue
+            pdir = plugins_dir / name
+            if not pdir.is_dir():
+                continue
+
+            default_enabled = True
+            pjson = pdir / "plugin.json"
+            if pjson.is_file():
+                try:
+                    default_enabled = not bool(json.loads(pjson.read_text(encoding="utf-8")).get("disabled"))
+                except Exception:
+                    default_enabled = True
+
+            if name in cfg_plugins and isinstance(cfg_plugins[name], dict) and "enabled" in cfg_plugins[name]:
+                enabled = bool(cfg_plugins[name]["enabled"])
+            else:
+                enabled = default_enabled
+
+            sk_files = list((pdir / "skills").glob("*/SKILL.md")) if (pdir / "skills").is_dir() else []
+            rule_files = list((pdir / "rules").glob("*.md")) if (pdir / "rules").is_dir() else []
+            has_mcp = (pdir / "mcp_config.json").is_file()
+
+            sk_chars = 0
+            for sf in sk_files:
+                txt = sf.read_text(encoding="utf-8", errors="replace")
+                m = FRONTMATTER_RE.match(txt)
+                sk_chars += len(m.group(1)) if m else min(240, len(txt))
+            rule_chars = sum(len(rf.read_text(encoding="utf-8", errors="replace")) for rf in rule_files)
+            est_tok = int((sk_chars + rule_chars) / 3.2) + len(sk_files) * 20
+
+            if enabled:
+                enabled_tokens += est_tok
+            else:
+                disabled_tokens += est_tok
+
+            items.append(
+                {
+                    "name": name,
+                    "enabled": enabled,
+                    "skill_count": len(sk_files),
+                    "rule_count": len(rule_files),
+                    "has_mcp": has_mcp,
+                    "estimated_tokens": est_tok,
+                }
+            )
+
+    return {
+        "plugins_dir": "~/.gemini/config/plugins",
+        "total_count": len(items),
+        "enabled_count": sum(1 for x in items if x["enabled"]),
+        "disabled_count": sum(1 for x in items if not x["enabled"]),
+        "enabled_tokens": enabled_tokens,
+        "disabled_tokens": disabled_tokens,
+        "plugins": items,
+    }
+
+
+def set_agy_plugins_state(
+    plugin_names: Sequence[str],
+    enabled: bool,
+    home_dir: Optional[Path] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Toggle Antigravity plugins via official `agy plugin enable/disable` or `config.json`."""
+    home = (home_dir or Path.home()).resolve()
+    info = scan_agy_plugins(home)
+    known = {p["name"]: p for p in info["plugins"]}
+    changed: List[str] = []
+    missing: List[str] = []
+
+    agy_bin = shutil.which("agy") or str(home / ".local" / "bin" / "agy")
+    use_cli = (home == Path.home().resolve()) and Path(agy_bin).is_file()
+
+    for name in plugin_names:
+        if name not in known:
+            missing.append(name)
+            continue
+        if known[name]["enabled"] == enabled:
+            continue
+        changed.append(name)
+        if not dry_run:
+            if use_cli:
+                verb = "enable" if enabled else "disable"
+                subprocess.run([agy_bin, "plugin", verb, name], check=True, capture_output=True, text=True)
+            else:
+                cfg_path = home / ".gemini" / "config" / "config.json"
+                cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                data = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
+                pmap = data.setdefault("plugins", {})
+                pmap[name] = {"enabled": enabled}
+                cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    saved_tokens = sum(known[n]["estimated_tokens"] for n in changed) * (-1 if not enabled else 1)
+    return {
+        "dry_run": dry_run,
+        "enabled": enabled,
+        "changed": changed,
+        "missing": missing,
+        "delta_tokens": saved_tokens,
     }
 
 
@@ -320,12 +453,31 @@ def adopt_skills(
     snapshot_entries: List[Dict[str, Any]] = []
     actions: List[str] = []
     adopted_skills: Set[str] = set()
+    adopted_source: Dict[str, Path] = {}
     healed_links: List[str] = []
     backed_up_diverged: List[str] = []
 
     if not dry_run:
         store_dir.mkdir(parents=True, exist_ok=True)
         snap_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-scan physical copies to pick the newest SKILL.md mtime when duplicates exist
+    newest_phys: Dict[str, Tuple[float, Path]] = {}
+    for hid in target_ids:
+        spec = HARNESS_SPECS[hid]
+        for rel_dir in (spec["skills"], spec["off"]):
+            base = home / rel_dir
+            if not base.is_dir():
+                continue
+            for name in sorted(os.listdir(base)):
+                if name.startswith(".") or name.startswith("_"):
+                    continue
+                entry = base / name
+                if not entry.is_symlink() and entry.is_dir():
+                    md = entry / "SKILL.md"
+                    mt = md.stat().st_mtime if md.is_file() else entry.stat().st_mtime
+                    if name not in newest_phys or mt > newest_phys[name][0]:
+                        newest_phys[name] = (mt, entry)
 
     # Pass 1: Snapshot & populate canonical store `~/.paos/store/skills/<name>`
     for hid in target_ids:
@@ -350,30 +502,62 @@ def adopt_skills(
                 )
 
                 canonical = store_dir / name
+                already_has_canon = canonical.exists() or canonical.is_symlink() or (name in adopted_source)
                 if is_link:
                     if entry.exists():
                         real_target = entry.resolve()
                         if _inside_external_git_repo(real_target, home):
-                            if not (canonical.exists() or canonical.is_symlink()):
+                            if not already_has_canon:
                                 actions.append(f"store link {name} -> {real_target}")
                                 adopted_skills.add(name)
+                                adopted_source[name] = real_target
                                 if not dry_run:
                                     os.symlink(str(real_target), str(canonical))
-                        elif real_target != canonical and not (canonical.exists() or canonical.is_symlink()):
+                        elif real_target != canonical and not already_has_canon:
                             actions.append(f"move resolved {real_target} -> {canonical}")
                             adopted_skills.add(name)
+                            adopted_source[name] = real_target
                             if not dry_run:
                                 shutil.move(str(real_target), str(canonical))
                 elif entry.is_dir():
-                    if not (canonical.exists() or canonical.is_symlink()):
-                        actions.append(f"adopt dir {entry} -> {canonical}")
+                    preferred = newest_phys.get(name, (0.0, entry))[1]
+                    if not already_has_canon and entry == preferred:
+                        actions.append(f"adopt newest dir {entry} -> {canonical}")
                         adopted_skills.add(name)
+                        adopted_source[name] = entry
                         if not dry_run:
                             shutil.move(str(entry), str(canonical))
                             os.symlink(str(canonical), str(entry))
+                    elif not already_has_canon and entry != preferred:
+                        # Adopt `preferred` into canonical first, then handle `entry` as duplicate/diverged!
+                        actions.append(f"adopt newest dir {preferred} -> {canonical}")
+                        adopted_skills.add(name)
+                        adopted_source[name] = preferred
+                        h_pref = _skill_md_hash(preferred)
+                        h_entry = _skill_md_hash(entry)
+                        if not dry_run:
+                            shutil.move(str(preferred), str(canonical))
+                            os.symlink(str(canonical), str(preferred))
+                        if h_pref != h_entry:
+                            b_dst = div_backup_root / f"diverged-{ts}" / hid / name
+                            backed_up_diverged.append(f"{hid}:{name}")
+                            actions.append(f"backup older diverged {entry} -> {b_dst}")
+                            if not dry_run:
+                                b_dst.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(entry), str(b_dst))
+                                os.symlink(str(canonical), str(entry))
+                        else:
+                            actions.append(f"dedup identical dir {entry} -> symlink {canonical}")
+                            if not dry_run:
+                                shutil.rmtree(entry)
+                                os.symlink(str(canonical), str(entry))
                     else:
                         # Canonical already exists: preserve any diverged copy before rewiring!
-                        canon_real = canonical.resolve() if canonical.exists() else canonical
+                        canon_real = (
+                            canonical.resolve()
+                            if canonical.exists()
+                            else adopted_source.get(name, canonical)
+                        )
                         if entry.resolve() != canon_real:
                             h_canon = _skill_md_hash(canon_real)
                             h_entry = _skill_md_hash(entry)

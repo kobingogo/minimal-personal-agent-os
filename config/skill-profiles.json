@@ -4,6 +4,10 @@
     "agy-customizations",
     "antigravity-guide"
   ],
+  "always_keep_agy_plugins": [
+    "agy-fast",
+    "egm"
+  ],
   "profiles": {
     "minimal": {
       "description": "极致精简档：仅保留核心通用主力（日常轻量问答，五端最低启动上下文税）",
@@ -11,7 +15,8 @@
         "mac-deep-clean",
         "oss-picker",
         "find-skills"
-      ]
+      ],
+      "agy_plugins": []
     },
     "writing": {
       "description": "内容创作档：长文去 AI 味 + X 草稿无损排版 + 封面与信息图引擎 + 多平台检索",
@@ -27,6 +32,9 @@
         "punk-cover",
         "proof-as-graphic",
         "*publish*"
+      ],
+      "agy_plugins": [
+        "chrome-devtools-plugin"
       ]
     },
     "coding": {
@@ -43,6 +51,10 @@
         "reverse-engineer-anything",
         "colab-operator",
         "run-workflow"
+      ],
+      "agy_plugins": [
+        "chrome-devtools-plugin",
+        "google-antigravity-sdk"
       ]
     },
     "video": {
@@ -55,17 +67,38 @@
         "hypit",
         "hand-drawn-canvas-animation",
         "colab-operator"
+      ],
+      "agy_plugins": [
+        "chrome-devtools-plugin"
       ]
     },
     "lark": {
       "description": "飞书协同办公档：云文档 / 多维表格 / 日历 / 会议妙记 / IM / 审批全套套件",
       "keep": [
         "lark-*"
+      ],
+      "agy_plugins": []
+    },
+    "science": {
+      "description": "科研与生信文献档：按需唤醒 AlphaFold / 基因组 / 化学信息学 / 学术文献检索套件",
+      "keep": [
+        "colab-operator",
+        "oss-picker"
+      ],
+      "agy_plugins": [
+        "chemistry",
+        "genomics",
+        "structural-biology",
+        "scientific-literature",
+        "science-overview"
       ]
     },
     "all": {
-      "description": "全量恢复档：恢复挂载技能仓中全部可用技能（高上下文占用，仅排查或全栈混合作业时使用）",
+      "description": "全量恢复档：恢复挂载技能仓与插件包中全部可用项（高上下文占用，仅排查时使用）",
       "keep": [
+        "*"
+      ],
+      "agy_plugins": [
         "*"
       ]
     }
