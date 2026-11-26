@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive unit & integration test suite for PAOS (zero third-party deps)."""
+"""Comprehensive unit & integration test suite for PAOS v0.2 (zero third-party deps)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,18 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 sys.path.insert(0, str(REPO_ROOT / "hooks"))
 
 from paos.doctor import run_doctor  # noqa: E402
-from paos.harden import apply_harden, merge_claude_settings, rollback_settings  # noqa: E402
+from paos.harden import (  # noqa: E402
+    apply_codex_harden,
+    apply_harden,
+     rollback_settings,
+)
+from paos.harnesses import (  # noqa: E402
+    adopt_skills,
+    clean_harnesses,
+    restore_links,
+    scan_matrix,
+    use_profile,
+)
 from paos.skills import (  # noqa: E402
     apply_profile,
     clean_broken_skills,
@@ -139,7 +150,6 @@ class TestStopVerifyLoopBreaker(unittest.TestCase):
         env["PAOS_VERIFY_CMD"] = "exit 1"
         env["PAOS_MAX_STOP_RETRIES"] = "2"
 
-        # 1. Clean repo -> exits 0 immediately without running failing command
         r_clean = subprocess.run(
             [sys.executable, str(STOP_SCRIPT)],
             input=json.dumps({"cwd": str(self.tmp), "session_id": "s1", "stop_hook_active": False}),
@@ -149,7 +159,6 @@ class TestStopVerifyLoopBreaker(unittest.TestCase):
         )
         self.assertEqual(r_clean.returncode, 0)
 
-        # 2. Dirty repo -> blocks twice (exit 2), then trips Stuck-Cap on 3rd try (exit 0)!
         (self.tmp / "app.py").write_text("x = 1\n", encoding="utf-8")
         r1 = subprocess.run(
             [sys.executable, str(STOP_SCRIPT)],
@@ -189,7 +198,7 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
         shutil.rmtree(self.ws, ignore_errors=True)
 
-    def test_idempotent_deep_merge_and_rollback(self) -> None:
+    def test_idempotent_deep_merge_codex_rules_and_rollback(self) -> None:
         claude_dir = self.home / ".claude"
         claude_dir.mkdir(parents=True)
         original = {
@@ -200,9 +209,21 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
         original_txt = json.dumps(original, indent=2) + "\n"
         (claude_dir / "settings.json").write_text(original_txt, encoding="utf-8")
 
-        res1 = apply_harden(REPO_ROOT, home_dir=self.home, configure_git=False)
+        # Also pre-populate user's existing ~/.codex/rules/default.rules to verify non-destruction
+        codex_rules = self.home / ".codex" / "rules"
+        codex_rules.mkdir(parents=True)
+        (codex_rules / "default.rules").write_text(
+            'prefix_rule(pattern=["echo", "hi"], decision="allow")\n', encoding="utf-8"
+        )
+
+        res1 = apply_harden(REPO_ROOT, home_dir=self.home, configure_git=False, include_codex=True)
         self.assertTrue(res1["changed"])
         self.assertIsNotNone(res1["backup_path"])
+        self.assertIsNotNone(res1["codex"])
+        self.assertTrue(res1["codex"]["changed"])
+        self.assertTrue(res1["codex"]["verified"])
+        self.assertTrue((codex_rules / "default.rules").is_file())
+        self.assertTrue((codex_rules / "paos-guardrails.rules").is_file())
 
         merged = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(merged["env"]["DISABLE_TELEMETRY"], "1")
@@ -210,11 +231,11 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
         self.assertFalse(merged["sandbox"]["allowUnsandboxedCommands"])
         self.assertTrue(merged["sandbox"]["failIfUnavailable"])
 
-        # Second run is 100% idempotent
-        res2 = apply_harden(REPO_ROOT, home_dir=self.home, configure_git=False)
+        # Second run is 100% idempotent on both Claude and Codex
+        res2 = apply_harden(REPO_ROOT, home_dir=self.home, configure_git=False, include_codex=True)
         self.assertFalse(res2["changed"])
+        self.assertFalse(res2["codex"]["changed"])
 
-        # Rollback restores exact prior settings
         ok, _ = rollback_settings(home_dir=self.home)
         self.assertTrue(ok)
         self.assertEqual((claude_dir / "settings.json").read_text(encoding="utf-8"), original_txt)
@@ -242,7 +263,6 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
         self.assertEqual(prof["resulting_active"], ["ayi-longform-vivid", "daily-intel"])
 
     def test_doctor_detects_risks_and_redacts_secrets(self) -> None:
-        # 1. Create over-200-line MEMORY.md & leaked inline secret in settings.local.json
         mem_dir = self.ws / "memory"
         mem_dir.mkdir(parents=True)
         (mem_dir / "MEMORY.md").write_text("\n".join(f"- line {i}" for i in range(215)), encoding="utf-8")
@@ -259,7 +279,6 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
             encoding="utf-8",
         )
 
-        # Bad flat hook schema in ~/.claude/settings.json
         home_claude = self.home / ".claude"
         home_claude.mkdir(parents=True)
         (home_claude / "settings.json").write_text(
@@ -270,7 +289,6 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
         report = run_doctor(workspace=self.ws, home_dir=self.home)
         serialized = json.dumps(report, ensure_ascii=False)
 
-        # CRITICAL: Raw secret MUST NEVER appear in report!
         self.assertNotIn(raw_secret, serialized)
         self.assertGreaterEqual(report["summary"]["fail"], 2)
         self.assertIn("200 行", serialized)
@@ -303,6 +321,86 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
         self.assertIn("Test quick idea", r.stdout)
         inbox_txt = (self.ws / "memory" / "INBOX.md").read_text(encoding="utf-8")
         self.assertIn("Test quick idea", inbox_txt)
+
+
+class TestCrossHarnessControlPlaneV02(unittest.TestCase):
+    """Tests `paos matrix`, `adopt`, `restore-links`, `use`, and `clean` across 5 harnesses."""
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp(prefix="paos-v02-home-"))
+        # Simulate real-world chaos:
+        # 1. `hyperframes` was moved from `.claude/skills/` to `.claude/skills-off/`, breaking `.cursor/skills/hyperframes` daisy-chain!
+        claude_sk = self.home / ".claude" / "skills"
+        claude_off = self.home / ".claude" / "skills-off"
+        codex_sk = self.home / ".codex" / "skills"
+        agents_sk = self.home / ".agents" / "skills"
+        cursor_sk = self.home / ".cursor" / "skills"
+        for d in (claude_sk, claude_off, codex_sk, agents_sk, cursor_sk):
+            d.mkdir(parents=True)
+
+        def make_skill(parent: Path, name: str, desc: str) -> Path:
+            sd = parent / name
+            sd.mkdir(parents=True, exist_ok=True)
+            (sd / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\n", encoding="utf-8")
+            return sd
+
+        make_skill(claude_sk, "ayi-longform-vivid", "Writing style engine")
+        make_skill(claude_off, "hyperframes", "Video composition engine")
+        make_skill(agents_sk, "lark-doc", "Feishu cloud docs")
+        make_skill(agents_sk, "lark-im", "Feishu messaging")
+        make_skill(codex_sk, "tdd", "Test-driven development")
+        # Diverged duplicate of `tdd` in `.agents/skills`!
+        make_skill(agents_sk, "tdd", "Modified diverged TDD description")
+
+        # Broken daisy-chain symlink in Cursor pointing to `.claude/skills/hyperframes`!
+        os.symlink(str(claude_sk / "hyperframes"), cursor_sk / "hyperframes")
+        # Truly dead symlink in Codex
+        os.symlink("/nonexistent/ghost-skill", codex_sk / "ghost-skill")
+        # Orphaned `.codex` crash temp file + `.DS_Store`
+        (self.home / ".codex" / "..codex-global-state.json.tmp-12345").write_text("trash", encoding="utf-8")
+        (claude_sk / ".DS_Store").write_bytes(b"\x00\x01\x02")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_matrix_adopt_use_clean_and_restore_roundtrip(self) -> None:
+        # 1. `scan_matrix` detects daisy-chain break, diverged copy, and orphan temp bloat
+        m0 = scan_matrix(self.home)
+        self.assertEqual(m0["totals"]["broken_symlinks"], 2)  # hyperframes + ghost-skill
+        self.assertEqual(m0["totals"]["daisy_chain_symlinks"], 1)  # cursor -> claude
+        self.assertEqual(m0["totals"]["diverged_physical_skills"], 1)  # tdd
+        self.assertGreaterEqual(m0["totals"]["orphan_temp_files"], 2)
+
+        # 2. `adopt_skills` consolidates into `~/.paos/store/skills`, backs up diverged `tdd`, and heals Cursor's `hyperframes`!
+        adp = adopt_skills(home_dir=self.home)
+        self.assertIn("cursor:hyperframes", adp["healed_broken_links"])
+        self.assertEqual(len(adp["backed_up_diverged"]), 1)
+        self.assertTrue((self.home / ".cursor" / "skills" / "hyperframes").exists())
+
+        # 3. `clean_harnesses` removes `.codex` orphan temp file & `.DS_Store`, and quarantines dead `ghost-skill`
+        cln = clean_harnesses(home_dir=self.home)
+        self.assertGreaterEqual(len(cln["removed_orphan_files"]), 2)
+        self.assertIn("codex:ghost-skill", cln["quarantined_broken_symlinks"])
+        m1 = scan_matrix(self.home)
+        self.assertEqual(m1["totals"]["broken_symlinks"], 0)
+        self.assertEqual(m1["totals"]["daisy_chain_symlinks"], 0)
+
+        # 4. `use_profile("writing")` switches ALL installed harnesses to writing skills in one shot!
+        pf = REPO_ROOT / "config" / "skill-profiles.json"
+        u_write = use_profile("writing", pf, home_dir=self.home)
+        self.assertEqual(u_write["desired_skills"], ["ayi-longform-vivid"])
+        for h in ("claude", "codex", "agents", "cursor"):
+            sk_dir = self.home / (".claude/skills" if h == "claude" else f".{h}/skills")
+            active = [x for x in os.listdir(sk_dir) if not x.startswith(".")]
+            self.assertEqual(active, ["ayi-longform-vivid"], f"Mismatch on {h}: {active}")
+
+        # 5. `use_profile("lark")` activates `lark-doc` & `lark-im` across harnesses without breaking any links
+        u_lark = use_profile("lark", pf, home_dir=self.home)
+        self.assertEqual(u_lark["desired_skills"], ["lark-doc", "lark-im"])
+
+        # 6. `restore_links` restores pre-adopt snapshot cleanly
+        ok, msg = restore_links(self.home)
+        self.assertTrue(ok, msg)
 
 
 if __name__ == "__main__":

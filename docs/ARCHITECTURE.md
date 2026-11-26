@@ -31,4 +31,13 @@ PAOS 强制拆成三个物理边界：
 | 自动入口 | `CLAUDE.md` (`@import`) | `AGENTS.md` | `SOUL.md` + `USER.md` + `AGENTS.md` |
 | 每日命令 | `.claude/commands/{triage,reflect,promote}.md` | 直接读取同目录 Markdown 执行 | 映射为 Gateway 快捷指令 |
 | 技能规范 | `.claude/skills/<name>/SKILL.md` | `~/.codex/skills/<name>/SKILL.md` | ClawHub / 本地 `skills/` |
+| 安全门禁 | `~/.claude/settings.json` + `pre_tool_gate.py` | `~/.codex/rules/paos-guardrails.rules` (Starlark) | 宿主机容器隔离 + 网络代理 |
 | 定时巡检 | `hooks/heartbeat-run.sh` (`claude -p`) | `codex exec` 替换同脚本命令 | 原生 `HEARTBEAT.md` 守护进程 |
+
+## 5. v0.2 跨客户端一级真源与 `nvm` 式切档架构
+
+重度多工具用户本机同时存在 `~/.claude/skills`、`~/.codex/skills`、`~/.agents/skills`、`~/.gemini/antigravity-cli/skills` 与 `~/.cursor/skills` 五套槽位。传统安装器常建立跨客户端二级软链（如 `cursor -> .claude/skills/foo`），导致单端停用某技能时引发其他客户端大面积断链。
+
+`paos` v0.2 引入两层解耦设计：
+1. **单一物理真源索引（`~/.paos/store/skills/`）**：`paos adopt` 将独立实体目录收归真源仓（外部 Git 仓库技能保持原位软链不搬移；内容分叉副本自动备份至 `~/.paos/backups/`），将五端全部改写为**一级直连软链**，并落盘 `~/.paos/snapshots/` 快照支持 `paos restore-links` 一键无损还原。
+2. **多端同步 `paos use <profile>`**：像 `nvm use` 切换 Node 版本一样，按 `minimal` / `writing` / `coding` / `video` / `lark` / `all` 预设在 50ms 内同步改写各目标客户端的一级挂载软链，彻底终结二级断链与多端上下文税失控。

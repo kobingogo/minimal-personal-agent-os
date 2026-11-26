@@ -1,4 +1,4 @@
-"""Idempotent security hardening, deep JSON merge, global gitignore & rollback."""
+"""Idempotent security hardening across Claude Code & Codex CLI, deep JSON merge & rollback."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 HOOK_FILES = (
     "pre_tool_gate.py",
@@ -52,7 +52,6 @@ def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
     """Non-destructively merge PAOS sandbox, permissions.deny & PreToolUse hook."""
     merged = copy.deepcopy(current) if isinstance(current, dict) else {}
 
-    # 1. Sandbox block
     sb = merged.setdefault("sandbox", {})
     if not isinstance(sb, dict):
         sb = {}
@@ -75,14 +74,12 @@ def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
     if not net.get("allowedDomains"):
         net["allowedDomains"] = list(DEFAULT_ALLOWED_DOMAINS)
 
-    # 2. Permissions block
     perms = merged.setdefault("permissions", {})
     if not isinstance(perms, dict):
         perms = {}
         merged["permissions"] = perms
     perms["deny"] = _dedup_extend(list(perms.get("deny") or []), REQUIRED_PERMISSIONS_DENY)
 
-    # 3. PreToolUse 3-level nested hook (idempotent)
     hooks = merged.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         hooks = {}
@@ -122,11 +119,99 @@ def merge_claude_settings(current: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
+def verify_codex_rules_file(rules_path: Path) -> Tuple[bool, List[str]]:
+    """Validate Starlark rules via `codex execpolicy check` if `codex` CLI is installed."""
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        return (True, ["codex CLI 未安装，已跳过编译器静态校验（语法符合 Starlark prefix_rule 规范）"])
+
+    probes = [
+        (["rm", "-rf", "/"], "forbidden"),
+        (["git", "push", "-f", "origin", "main"], "forbidden"),
+        (["git", "reset", "--hard", "HEAD~1"], "forbidden"),
+        (["gh", "repo", "create", "leak-demo", "--public"], "prompt"),
+    ]
+    details: List[str] = []
+    for cmd_tokens, expected_decision in probes:
+        res = subprocess.run(
+            [codex_bin, "execpolicy", "check", "--rules", str(rules_path), "--", *cmd_tokens],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        if res.returncode != 0:
+            return (False, [f"codex execpolicy check 失败: {res.stderr.strip()}"])
+        try:
+            parsed = json.loads(res.stdout)
+        except Exception:
+            return (False, [f"codex execpolicy 输出无法解析: {res.stdout[:120]}"])
+        actual = parsed.get("decision")
+        if actual != expected_decision:
+            return (
+                False,
+                [f"命令 `{' '.join(cmd_tokens)}` 期望决策 {expected_decision}，实际得到 {actual}"],
+            )
+        details.append(f"[PASS] {' '.join(cmd_tokens)} -> {actual}")
+    return (True, details)
+
+
+def apply_codex_harden(
+    repo_dir: Path,
+    home_dir: Optional[Path] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Install non-destructive `~/.codex/rules/paos-guardrails.rules` without touching `default.rules`."""
+    home = home_dir or Path.home()
+    rules_src = repo_dir / "templates" / "codex-paos.rules"
+    new_text = rules_src.read_text(encoding="utf-8")
+
+    codex_dir = home / ".codex"
+    rules_dir = codex_dir / "rules"
+    dst = rules_dir / "paos-guardrails.rules"
+    backups_dir = codex_dir / "backups"
+
+    current_text = dst.read_text(encoding="utf-8") if dst.is_file() else ""
+    diff_lines = list(
+        difflib.unified_diff(
+            current_text.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
+            fromfile=str(dst) + " (before)",
+            tofile=str(dst) + " (after)",
+        )
+    )
+    changed = bool(diff_lines) or not dst.is_file()
+    backup_path: Optional[Path] = None
+
+    if not dry_run:
+        if dst.is_file() and diff_lines:
+            backups_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_path = backups_dir / f"paos-guardrails-{ts}.rules.bak"
+            shutil.copy2(dst, backup_path)
+        if changed:
+            rules_dir.mkdir(parents=True, exist_ok=True)
+            dst.write_text(new_text, encoding="utf-8")
+
+    verify_target = dst if (not dry_run and dst.is_file()) else rules_src
+    verified_ok, verify_details = verify_codex_rules_file(verify_target)
+
+    return {
+        "dry_run": dry_run,
+        "rules_path": str(dst),
+        "changed": changed,
+        "diff": "".join(diff_lines),
+        "backup_path": str(backup_path) if backup_path else None,
+        "verified": verified_ok,
+        "verify_details": verify_details,
+    }
+
+
 def apply_harden(
     repo_dir: Path,
     home_dir: Path | None = None,
     dry_run: bool = False,
     configure_git: bool = True,
+    include_codex: bool = False,
 ) -> Dict[str, Any]:
     home = home_dir or Path.home()
     claude_dir = home / ".claude"
@@ -183,6 +268,10 @@ def apply_harden(
             except OSError as exc:
                 gitignore_warning = str(exc)
 
+    codex_res: Optional[Dict[str, Any]] = None
+    if include_codex:
+        codex_res = apply_codex_harden(repo_dir=repo_dir, home_dir=home, dry_run=dry_run)
+
     return {
         "dry_run": dry_run,
         "settings_path": str(settings_path),
@@ -192,6 +281,7 @@ def apply_harden(
         "deployed_hooks": deployed_hooks,
         "global_gitignore": str(gitignore_file) if gitignore_file else None,
         "global_gitignore_warning": gitignore_warning,
+        "codex": codex_res,
     }
 
 

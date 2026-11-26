@@ -12,14 +12,16 @@ fi
 chmod +x "$PAOS_BIN" "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh
 
 if [ "${1:-}" = "--dry-run" ]; then
-  exec "$PAOS_BIN" harden --dry-run
+  "$PAOS_BIN" matrix
+  echo ""
+  exec "$PAOS_BIN" harden --all --dry-run
 fi
 
-echo "==> [1/3] 非破坏性合并安全沙盒、权限锁与钩子 (自动备份已有配置)..."
-"$PAOS_BIN" harden
+echo "==> [1/4] 非破坏性合并 Claude 沙盒钩子与 Codex Starlark 门禁 (自动备份已有配置)..."
+"$PAOS_BIN" harden --all
 
 echo ""
-echo "==> [2/3] 运行词法级 PreToolUse 拦截器自检 (零外部依赖)..."
+echo "==> [2/4] 运行词法级 PreToolUse 拦截器自检 (零外部依赖)..."
 GATE="$HOME/.claude/hooks/pre_tool_gate.py"
 
 assert_block() {
@@ -56,8 +58,12 @@ assert_allow "commit 消息含 git push -f 文本" '{"tool_name":"Bash","tool_in
 assert_allow "env FOO=1 npm test"            '{"tool_name":"Bash","tool_input":{"command":"env FOO=1 npm test"}}'
 
 echo ""
-echo "==> [3/3] 运行本机 PAOS Doctor 真机体检..."
+echo "==> [3/4] 运行本机 PAOS Doctor 真机体检..."
 "$PAOS_BIN" doctor --workspace "$REPO_DIR" || true
+
+echo ""
+echo "==> [4/4] 扫描本机五大客户端 Cross-Harness 技能矩阵..."
+"$PAOS_BIN" matrix || true
 
 echo ""
 echo "部署完成！建议将 paos 加入 PATH："

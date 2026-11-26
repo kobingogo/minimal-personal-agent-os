@@ -1,43 +1,72 @@
 {
   "always_keep": [
-    "daily-intel"
+    "daily-intel",
+    "agy-customizations",
+    "antigravity-guide"
   ],
   "profiles": {
     "minimal": {
-      "description": "极致精简档：仅保留核心通用主力（适合日常轻量对话，最低启动上下文）",
+      "description": "极致精简档：仅保留核心通用主力（日常轻量问答，五端最低启动上下文税）",
       "keep": [
         "mac-deep-clean",
-        "oss-picker"
+        "oss-picker",
+        "find-skills"
       ]
     },
     "writing": {
-      "description": "内容创作档：长文去 AI 味 + 配图引擎 + 推文发布工作流",
+      "description": "内容创作档：长文去 AI 味 + X 草稿无损排版 + 封面与信息图引擎 + 多平台检索",
       "keep": [
         "*tweet*",
         "*infographic*",
         "*longform*",
-        "*post-to-x*",
+        "x-article-draft",
+        "nextx",
+        "agent-reach",
+        "last30days*",
         "*xiaohei*",
+        "punk-cover",
+        "proof-as-graphic",
         "*publish*"
       ]
     },
     "coding": {
-      "description": "软件工程档：TDD + 代码审查 + 架构拆解 + Bug 排查",
+      "description": "软件工程档：TDD + 代码审查 + 架构设计 + 浏览器调试 + 逆向与安全排障",
       "keep": [
         "tdd",
         "code-review",
         "diagnosing-bugs",
         "codebase-design",
-        "git-guardrails*"
+        "git-guardrails*",
+        "chrome-devtools",
+        "memory-leak-debugging",
+        "a11y-debugging",
+        "reverse-engineer-anything",
+        "colab-operator",
+        "run-workflow"
       ]
     },
     "video": {
-      "description": "视觉与视频产线档：视频导演与动效编排技能",
+      "description": "视觉与视频产线档：HyperFrames 全家桶 + 视频路由 + 手绘与动效编排",
       "keep": [
         "*video*",
-        "hyperframes",
-        "hyperframes-core",
-        "motion-graphics"
+        "hyperframes*",
+        "motion-graphics",
+        "media-use",
+        "hypit",
+        "hand-drawn-canvas-animation",
+        "colab-operator"
+      ]
+    },
+    "lark": {
+      "description": "飞书协同办公档：云文档 / 多维表格 / 日历 / 会议妙记 / IM / 审批全套套件",
+      "keep": [
+        "lark-*"
+      ]
+    },
+    "all": {
+      "description": "全量恢复档：恢复挂载技能仓中全部可用技能（高上下文占用，仅排查或全栈混合作业时使用）",
+      "keep": [
+        "*"
       ]
     }
   }
