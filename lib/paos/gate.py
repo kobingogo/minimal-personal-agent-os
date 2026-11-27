@@ -110,11 +110,32 @@ def matches_guardrail_path(raw_path: str, cwd: Optional[str] = None) -> bool:
     return bool(REPO_GUARDRAIL_RE.search(abs_norm))
 
 
+SAFE_DOTENV_SUFFIXES = (".example", ".sample", ".template", ".dist", ".schema")
+SYSTEM_TOP_DIRS = {
+    "/Users",
+    "/home",
+    "/System",
+    "/Library",
+    "/Applications",
+    "/etc",
+    "/var",
+    "/opt",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/private",
+    "/Volumes",
+}
+
+
 def matches_sensitive_read_path(raw_path: str, cwd: Optional[str] = None) -> bool:
-    """Defense-in-depth: block shell commands directly reading root credential files (`~/.paos/config.json`, `~/.ssh`, `~/.aws`, `~/.config/gh`)."""
+    """Defense-in-depth: block shell commands directly reading root credential or `.env` secret files."""
     if not raw_path or raw_path.startswith("-"):
         return False
-    home_rel, _ = _normalize_candidate_path(raw_path, cwd=cwd)
+    home_rel, abs_norm = _normalize_candidate_path(raw_path, cwd=cwd)
+    base = posixpath.basename(abs_norm)
+    if base == ".env" or (base.startswith(".env.") and not base.endswith(SAFE_DOTENV_SUFFIXES)):
+        return True
     if not home_rel:
         return False
     for sp in (".paos/config.json", ".ssh", ".aws", ".config/gh"):
@@ -374,12 +395,16 @@ def _check_rm(args: Sequence[str], cwd: str) -> None:
     for t in targets:
         raw_s = t.strip()
         home_rel, abs_norm = _normalize_candidate_path(raw_s, cwd=None)
-        is_root_or_glob = abs_norm in ("/", "/*") or raw_s in ("/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/*", "${HOME}/*")
+        is_root_or_glob = (
+            abs_norm in ("/", "/*")
+            or abs_norm in SYSTEM_TOP_DIRS
+            or raw_s in ("/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/*", "${HOME}/*")
+        )
         is_parent_traversal = raw_s in ("..", "../", "../*") or raw_s.startswith("../..")
         is_home_root = home_rel in (".", "*")
         if is_root_or_glob or is_parent_traversal or is_home_root:
             if has_recursive or has_force:
-                _block(f"禁止对根目录、家目录或父级目录执行递归/强制删除 (`rm ... {t}`)。", cwd=cwd)
+                _block(f"禁止对根目录、系统顶层目录、家目录或父级目录执行递归/强制删除 (`rm ... {t}`)。", cwd=cwd)
 
 
 def _check_git(args: Sequence[str], cwd: str) -> None:
@@ -823,7 +848,8 @@ def build_memory_snapshot(
 
     joined = "\n".join(out)
     if len(joined) > MAX_SESSION_START_CHARS:
-        joined = joined[: MAX_SESSION_START_CHARS - 40] + "\n...[已按预算截断，详见 memory/ 目录]"
+        notice = "\n...[开机快照超预算已显式截断，避免触发宿主 10k 静默预览；如需完整上下文请直接 Read ~/.paos/brain/memory/]"
+        joined = joined[: MAX_SESSION_START_CHARS - len(notice)] + notice
     return joined + "\n"
 
 

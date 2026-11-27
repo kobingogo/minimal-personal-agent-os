@@ -388,14 +388,17 @@ def scan_agy_plugins(home_dir: Optional[Path] = None) -> Dict[str, Any]:
         return {"installed": False, "total_count": 0, "enabled_count": 0, "disabled_count": 0, "enabled_tokens": 0, "disabled_tokens": 0, "plugins": []}
 
     enabled_map: Dict[str, bool] = {}
-    if cfg_path.is_file():
-        try:
+    config_unreadable = False
+    try:
+        if cfg_path.is_file():
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             for k, v in (cfg.get("plugins") or {}).items():
                 if isinstance(v, dict) and "enabled" in v:
                     enabled_map[k] = bool(v["enabled"])
-        except Exception:
-            pass
+    except PermissionError:
+        config_unreadable = True
+    except Exception:
+        pass
 
     items: List[Dict[str, Any]] = []
     enabled_tokens = 0
@@ -450,6 +453,7 @@ def scan_agy_plugins(home_dir: Optional[Path] = None) -> Dict[str, Any]:
 
     return {
         "installed": True,
+        "config_unreadable": config_unreadable,
         "total_count": len(items),
         "enabled_count": sum(1 for x in items if x["enabled"]),
         "disabled_count": sum(1 for x in items if not x["enabled"]),

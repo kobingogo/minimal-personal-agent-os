@@ -12,6 +12,7 @@ import platform
 import plistlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -58,17 +59,27 @@ def _validate_schedule(hour: int, minute: int, weekday: Optional[int]) -> None:
 
 
 def _default_cron_path(home: Path) -> str:
-    parts = [
+    candidates: List[str] = [
         str(home / ".local/bin"),
         str(home / ".bun/bin"),
         str(home / ".volta/bin"),
         str(home / ".cargo/bin"),
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
+        str(home / ".npm-global/bin"),
+        str(home / ".opencode/bin"),
     ]
-    return ":".join(parts)
+    nvm_nodes = home / ".nvm" / "versions" / "node"
+    if nvm_nodes.is_dir():
+        for bin_dir in sorted(nvm_nodes.glob("*/bin"), reverse=True):
+            if bin_dir.is_dir():
+                candidates.append(str(bin_dir))
+    for cli_name in ("paos", "codex", "claude", "agy", "uv"):
+        found = shutil.which(cli_name)
+        if found:
+            parent = str(Path(found).resolve().parent)
+            candidates.append(parent)
+    candidates.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"])
+    deduped = list(dict.fromkeys(p for p in candidates if p))
+    return ":".join(deduped)
 
 
 def _jobs_registry_path(home: Path) -> Path:

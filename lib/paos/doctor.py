@@ -101,12 +101,32 @@ def run_doctor(workspace: Optional[Path] = None, home_dir: Optional[Path] = None
     claude_state_json = home / ".claude.json"
     if claude_state_json.is_file():
         sz_kb = claude_state_json.stat().st_size / 1024.0
-        if sz_kb > 40:
+        stale_projects = 0
+        try:
+            cj_obj = json.loads(claude_state_json.read_text(encoding="utf-8", errors="replace"))
+            for pk, pv in ((cj_obj.get("projects") if isinstance(cj_obj, dict) else None) or {}).items():
+                if isinstance(pv, dict) and pv.get("mcpServers"):
+                    continue
+                if pk.startswith("/Volumes/"):
+                    parts = Path(pk).parts
+                    if len(parts) >= 3 and not (Path("/Volumes") / parts[2]).exists():
+                        continue
+                if not Path(pk).exists():
+                    stale_projects += 1
+        except Exception:
+            stale_projects = 0
+
+        if stale_projects > 0 or sz_kb > 256:
+            detail = (
+                f"检出 {stale_projects} 个已删除的失效项目缓存 ({sz_kb:.1f} KB)"
+                if stale_projects > 0
+                else f"体积过大 ({sz_kb:.1f} KB > 256 KB)"
+            )
             findings.append(
                 Finding(
                     "WARN",
                     "context",
-                    f"~/.claude.json 客户端状态文件膨胀 ({sz_kb:.1f} KB > 40 KB)，积压旧项目缓存易拖慢启动",
+                    f"~/.claude.json 客户端状态文件存在陈旧积压：{detail}",
                     "运行 `paos clean --prune-claude-state` 自动备份并清理已删除项目的陈旧缓存",
                 )
             )
@@ -253,6 +273,46 @@ def run_doctor(workspace: Optional[Path] = None, home_dir: Optional[Path] = None
             )
         else:
             findings.append(Finding("PASS", "sandbox", "内置 Read(.env) 与控制面写权限双锁已生效"))
+
+        # Audit `permissions.allow` across user & workspace settings for interpreter wildcards (e.g. `Bash(python3:*)`)
+        wildcard_bypasses: List[str] = []
+        dangerous_prefixes = (
+            "Bash(python",
+            "Bash(bash",
+            "Bash(sh:",
+            "Bash(sh ",
+            "Bash(zsh",
+            "Bash(node",
+            "Bash(bun",
+            "Bash(npx",
+            "Bash(uv run",
+            "Bash(find",
+            "Bash(xargs",
+        )
+        for allow_src in (settings_path, home / ".claude" / "settings.local.json", ws / ".claude" / "settings.local.json"):
+            if not allow_src.is_file():
+                continue
+            try:
+                a_obj = json.loads(allow_src.read_text(encoding="utf-8", errors="replace"))
+                allow_list = ((a_obj.get("permissions") if isinstance(a_obj, dict) else None) or {}).get("allow") or []
+                for rule in allow_list:
+                    r_str = str(rule).strip()
+                    if "*" in r_str and any(r_str.startswith(dp) for dp in dangerous_prefixes):
+                        # Safe if bound to an exact `.py`/`.sh` script path before `:*`
+                        if not any(ext in r_str.split("*")[0] for ext in (".py", ".sh", ".mjs", ".js", ".ts")):
+                            wildcard_bypasses.append(r_str)
+            except Exception:
+                pass
+        if wildcard_bypasses:
+            uniq_wb = list(dict.fromkeys(wildcard_bypasses))
+            findings.append(
+                Finding(
+                    "WARN",
+                    "sandbox",
+                    f"permissions.allow 存在解释器通配符白名单 ({', '.join(uniq_wb[:3])})，可绕过 deny 黑名单执行任意代码",
+                    "删除万能解释器通配符，改为绑定具体脚本路径（如 `Bash(python3 ~/.claude/hooks/x.py:*)`）",
+                )
+            )
 
     if (home / ".codex").is_dir():
         codex_guard = home / ".codex" / "rules" / "paos-guardrails.rules"

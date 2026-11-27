@@ -425,7 +425,12 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_sync(args: argparse.Namespace) -> int:
     targets = [t.strip() for t in args.targets.split(",") if t.strip()] if args.targets else None
-    res = sync_brain(targets=targets, dry_run=args.dry_run, remove=args.remove)
+    res = sync_brain(
+        targets=targets,
+        dry_run=args.dry_run,
+        remove=args.remove,
+        allow_shrink=bool(getattr(args, "allow_shrink", False)),
+    )
     action = "移除托管块" if args.remove else "同步挂载"
     mode = "(--dry-run 预览，未修改文件)" if args.dry_run else "(已非破坏性写入，首次触碰文件已自动备份至 ~/.paos/backups/)"
     print(f"=== PAOS Sync 跨客户端记忆与核心契约{action} {mode} ===")
@@ -790,6 +795,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sync.add_argument("--targets", help="逗号分隔的目标端（默认自动检测已安装端：claude,codex,antigravity,cursor）")
     p_sync.add_argument("--remove", action="store_true", help="干净移除各端受管块，100%% 保留手写内容")
+    p_sync.add_argument("--allow-shrink", action="store_true", help="确认允许 CORE_RULES.md / MEMORY.md 行数精简超过 50%%")
     p_sync.add_argument("--dry-run", action="store_true", help="仅打印 unified diff 预览，不修改任何文件")
     p_sync.set_defaults(func=cmd_sync)
 
@@ -892,6 +898,9 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
+    except PermissionError as exc:
+        print(f"[PAOS 权限受限] 当前沙盒禁止访问目标路径 ({exc})；请在宿主机终端直接执行。", file=sys.stderr)
+        return 1
     except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
         msg = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
         print(f"[PAOS 错误] {msg}", file=sys.stderr)

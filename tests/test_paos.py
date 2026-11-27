@@ -631,6 +631,79 @@ class TestPaosKernelPrimitives(unittest.TestCase):
         )
         self.assertIn("paos 0.1.0", r_mod.stdout)
 
+    def test_v010_teardown_hardening_build_backend_anti_erosion_and_wildcards(self) -> None:
+        # 1. Zero-dep PEP 517 in-repo backend builds compliant wheel & sdist with zero external libs
+        import importlib.util
+        import zipfile
+
+        spec = importlib.util.spec_from_file_location("_paos_build", REPO_ROOT / "_paos_build.py")
+        assert spec and spec.loader
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+
+        dist_dir = self.home / "dist"
+        whl_name = builder.build_wheel(str(dist_dir))
+        sdist_name = builder.build_sdist(str(dist_dir))
+        self.assertTrue((dist_dir / whl_name).is_file())
+        self.assertTrue((dist_dir / sdist_name).is_file())
+        with zipfile.ZipFile(dist_dir / whl_name) as zf:
+            names = set(zf.namelist())
+            self.assertIn("paos/cli.py", names)
+            self.assertIn("paos/assets/claude-user-settings.json", names)
+            self.assertTrue(any(n.endswith(".dist-info/entry_points.txt") for n in names))
+
+        # 2. Gate blocks top-level OS dirs (`sudo rm -rf /Users`) and `.env.production` reads, allows `.env.example`
+        from paos.gate import build_memory_snapshot, inspect_command
+
+        for blocked_cmd in ("sudo rm -rf /Users", "rm -rf /System", "cat .env", "cat config/.env.production"):
+            with self.assertRaises(SystemExit) as ctx:
+                inspect_command(blocked_cmd, cwd=str(self.repo))
+            self.assertEqual(ctx.exception.code, 2, f"Expected exit 2 for: {blocked_cmd}")
+
+        inspect_command("cat .env.example", cwd=str(self.repo))
+
+        # 3. SessionStart explicit truncation notice under 3,800 chars (avoids Claude 10k silent preview)
+        ib = init_brain(home_dir=self.home)
+        broot = Path(ib["brain_dir"])
+        (broot / "memory" / "TODAY.md").write_text("\n".join(f"- [ ] Task {i} " + ("x" * 180) for i in range(30)), encoding="utf-8")
+        snap = build_memory_snapshot(self.repo, home_dir=self.home)
+        self.assertLessEqual(len(snap), 3805)
+        self.assertIn("避免触发宿主 10k 静默预览", snap)
+
+        # 4. Anti-erosion shrink guard (`ESUSPECT_SHRINK`) + Policy Digest preservation
+        (self.home / ".claude").mkdir(parents=True, exist_ok=True)
+        long_rules = "\n".join(
+            [f"# Rule Section {i}\nNormal explanation filler line {i} " + ("a" * 90) for i in range(40)]
+            + ["- 严禁泄露任何生产私钥 (REDLINE_MUST_SURVIVE)"]
+            + [f"Tail filler {j} " + ("b" * 90) for j in range(20)]
+        )
+        (broot / "CORE_RULES.md").write_text(long_rules + "\n", encoding="utf-8")
+        sync_brain(home_dir=self.home, targets=["claude"])
+        codex_sync = sync_brain(home_dir=self.home, targets=["codex"])
+        self.assertTrue(codex_sync["files"][0]["changed"])
+        self.assertIn("REDLINE_MUST_SURVIVE", (self.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8"))
+
+        # Sudden >50% drop in CORE_RULES.md triggers RuntimeError unless `allow_shrink=True`
+        (broot / "CORE_RULES.md").write_text("# Tiny\n- one line\n", encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            sync_brain(home_dir=self.home, targets=["claude"])
+        sync_brain(home_dir=self.home, targets=["claude"], allow_shrink=True)
+
+        # 5. Doctor flags `Bash(python3:*)` wildcard bypass in `permissions.allow`
+        from paos.doctor import run_doctor
+        from paos.harden import apply_harden
+
+        apply_harden(repo_dir=REPO_ROOT, home_dir=self.home, configure_git=False, include_codex=False)
+        (self.home / ".claude" / "settings.local.json").write_text(
+            json.dumps({"permissions": {"allow": ["Bash(python3:*)", "Bash(python3 ~/.claude/hooks/safe.py:*)"]}}),
+            encoding="utf-8",
+        )
+        doc = run_doctor(workspace=self.repo, home_dir=self.home)
+        msgs = "\n".join(f["message"] for f in doc["findings"])
+        self.assertIn("解释器通配符白名单", msgs)
+        self.assertIn("Bash(python3:*)", msgs)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

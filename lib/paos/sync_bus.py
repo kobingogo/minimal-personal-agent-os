@@ -27,7 +27,12 @@ MANAGED_BLOCK_RE = re.compile(
 # Supports ASCII slugs and CJK/Unicode tags like `[tag:cache-bust]` or `[tag:缓存穿透]`
 TAG_RE = re.compile(r"\[tag:([^\s\[\]]+)\]")
 PROMOTED_RE = re.compile(r"\[promoted:")
+POLICY_LINE_RE = re.compile(
+    r"(^#{1,3}\s+|\b(?:must|never|do not|forbidden|security|secret|redline)\b|禁止|严禁|红线|铁律|必须)",
+    re.I,
+)
 ALLOWED_SYNC_TARGETS = ("claude", "codex", "antigravity", "cursor")
+MAX_CORE_RULES_CHARS = 4000
 
 DEFAULT_CORE_RULES = """# PAOS 跨端共享核心工程契约 (CORE_RULES)
 - 结论先行，简洁直接；执行删除、覆盖或外发操作前先说明影响并等待确认。
@@ -118,8 +123,74 @@ def init_brain(
     return {"brain_dir": str(broot), "created_files": created}
 
 
+def _compact_core_rules(core_txt: str, max_chars: int = MAX_CORE_RULES_CHARS) -> str:
+    """Structure-preserving truncation: keep 45% head + Policy Digest red-lines + 15% tail."""
+    if len(core_txt) <= max_chars:
+        return core_txt
+    head_budget = int(max_chars * 0.45)
+    tail_budget = int(max_chars * 0.15)
+    digest_budget = max(200, max_chars - head_budget - tail_budget - 80)
+    head = core_txt[:head_budget].rstrip()
+    tail = core_txt[-tail_budget:].lstrip()
+    middle = core_txt[head_budget : len(core_txt) - tail_budget]
+    digest_lines: List[str] = []
+    used = 0
+    for line in middle.splitlines():
+        s = line.strip()
+        if s and POLICY_LINE_RE.search(s):
+            if used + len(s) + 1 > digest_budget:
+                break
+            digest_lines.append(s)
+            used += len(s) + 1
+    digest_block = (
+        "\n[Policy Digest · 中段红线保底摘要]\n" + "\n".join(digest_lines)
+        if digest_lines
+        else "\n...[中段细则已折叠，详见 ~/.paos/brain/CORE_RULES.md]..."
+    )
+    return f"{head}\n{digest_block}\n{tail}"
+
+
+def _check_anti_erosion(home: Path, broot: Path, allow_shrink: bool = False, dry_run: bool = False) -> None:
+    """Guard against silent LLM memory/rule erosion (>50% sudden line drop on files with >=6 lines)."""
+    if not broot.is_dir():
+        return
+    state_file = home / ".paos" / "state" / "brain-guard.json"
+    prev: Dict[str, int] = {}
+    if state_file.is_file():
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                prev = {k: int(v) for k, v in data.items() if isinstance(v, int)}
+        except Exception:
+            prev = {}
+
+    curr: Dict[str, int] = {}
+    for rel in ("CORE_RULES.md", "memory/MEMORY.md"):
+        fp = broot / rel
+        if fp.is_file():
+            curr[rel] = sum(1 for l in fp.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip())
+
+    if not allow_shrink:
+        for rel, new_cnt in curr.items():
+            old_cnt = prev.get(rel, 0)
+            if old_cnt >= 6 and new_cnt < (old_cnt / 2.0):
+                raise RuntimeError(
+                    f"防侵蚀熔断 (ESUSPECT_SHRINK)：`{rel}` 非空行数从 {old_cnt} 行骤降至 {new_cnt} 行（>50% 丢失）。"
+                    "请检查是否被模型误覆盖；若确属人工精简，请加 `--allow-shrink` 重跑 `paos sync`。"
+                )
+
+    if not dry_run and curr:
+        try:
+            state_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            merged = {**prev, **curr}
+            state_file.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
 def _extract_active_summary(broot: Path) -> Dict[str, str]:
-    core_txt = (broot / "CORE_RULES.md").read_text(encoding="utf-8").strip() if (broot / "CORE_RULES.md").is_file() else ""
+    raw_core = (broot / "CORE_RULES.md").read_text(encoding="utf-8").strip() if (broot / "CORE_RULES.md").is_file() else ""
+    core_txt = _compact_core_rules(raw_core)
     today_p = broot / "memory" / "TODAY.md"
     today_lines: List[str] = []
     if today_p.is_file():
@@ -173,6 +244,7 @@ def sync_brain(
     targets: Optional[Sequence[str]] = None,
     dry_run: bool = False,
     remove: bool = False,
+    allow_shrink: bool = False,
 ) -> Dict[str, Any]:
     """Compile `~/.paos/brain/` into Claude, Codex, Antigravity, and Cursor non-destructively."""
     home = paos_home(home_dir)
@@ -180,6 +252,8 @@ def sync_brain(
     if not remove and not broot.is_dir():
         if not dry_run:
             init_brain(home)
+    if not remove:
+        _check_anti_erosion(home, broot, allow_shrink=allow_shrink, dry_run=dry_run)
 
     if targets:
         chosen = [t.strip().lower() for t in targets if t.strip()]
