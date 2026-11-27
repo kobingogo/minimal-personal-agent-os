@@ -262,17 +262,20 @@ def run_doctor(workspace: Optional[Path] = None, home_dir: Optional[Path] = None
             )
 
         perms_deny = " ".join(str(x) for x in ((settings_obj.get("permissions") or {}).get("deny") or []))
-        if "Read(.env" not in perms_deny or "Write(~/.claude" not in perms_deny or "Edit(~/.claude" not in perms_deny:
+        claude_ctrl_locked = "Edit(~/.claude/**)" in perms_deny or (
+            "Edit(~/.claude/settings" in perms_deny and "Edit(~/.claude/hooks" in perms_deny
+        )
+        if "Read(.env" not in perms_deny or not claude_ctrl_locked:
             findings.append(
                 Finding(
                     "WARN",
                     "sandbox",
-                    "permissions.deny 未完整封禁内置 Read(.env) 或 Write/Edit(~/.claude/**) 工具",
+                    "permissions.deny 未完整封禁内置 Read(.env) 或 Edit(~/.claude/settings*.json | hooks/**) 工具",
                     "运行 `paos harden` 同步写入 permissions.deny",
                 )
             )
         else:
-            findings.append(Finding("PASS", "sandbox", "内置 Read(.env) 与控制面写权限双锁已生效"))
+            findings.append(Finding("PASS", "sandbox", "内置 Read(.env) 与控制面 Edit 写权限双锁已生效"))
 
         # Audit `permissions.allow` across user & workspace settings for interpreter wildcards (e.g. `Bash(python3:*)`)
         wildcard_bypasses: List[str] = []
@@ -345,6 +348,7 @@ def run_doctor(workspace: Optional[Path] = None, home_dir: Optional[Path] = None
         schema_errors: List[str] = []
         cmd_paths: List[Tuple[Path, bool]] = []
         has_paos_gate = False
+        gate_fail_closed = False
         for event_name, matchers in hooks_cfg.items():
             if not isinstance(matchers, list):
                 schema_errors.append(f"{event_name} 必须是数组")
@@ -360,6 +364,8 @@ def run_doctor(workspace: Optional[Path] = None, home_dir: Optional[Path] = None
                         cmd_raw = str(h["command"]).strip()
                         if "pre_tool_gate" in cmd_raw:
                             has_paos_gate = True
+                            if h.get("onFailure") == "block":
+                                gate_fail_closed = True
                         try:
                             toks = shlex.split(cmd_raw)
                         except ValueError:
@@ -413,8 +419,17 @@ def run_doctor(workspace: Optional[Path] = None, home_dir: Optional[Path] = None
                         "运行 `paos harden` 非破坏性追加门禁钩子",
                     )
                 )
+            elif not gate_fail_closed:
+                findings.append(
+                    Finding(
+                        "WARN",
+                        "hooks",
+                        "PreToolUse 门禁钩子缺少 `\"onFailure\": \"block\"`（脚本异常或超时时会默认放行）",
+                        "运行 `paos harden` 自动补齐 Fail-Closed 配置",
+                    )
+                )
             else:
-                findings.append(Finding("PASS", "hooks", "Hooks 三层嵌套 Schema 合法且目标脚本均可执行"))
+                findings.append(Finding("PASS", "hooks", "Hooks 三层嵌套 Schema 合法、已开启 onFailure:block 且目标脚本可执行"))
 
         if "Stop" in hooks_cfg:
             findings.append(

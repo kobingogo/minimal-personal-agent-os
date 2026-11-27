@@ -162,6 +162,40 @@ class TestPreToolGate(unittest.TestCase):
         )
         self.assertEqual(r_cfg.returncode, 2)
 
+    def test_heredoc_bodies_are_data_unless_executed(self) -> None:
+        rm_home = "rm -fr ~"
+        # Quoted-delimiter bodies are literal data: dangerous-looking text and stray quotes must not block.
+        self.assert_allowed(f"cat > cases.py <<'EOF'\ncases = ['echo \"$({rm_home})\"', \"echo it's fine\"]\nEOF\npython3 cases.py")
+        self.assert_allowed("cat > notes.md <<'EOF'\nnever run git push -f\nEOF")
+        self.assert_allowed("cat > a.txt <<EOF\ntoday is $(date)\nEOF")
+        self.assert_allowed(f"python3 - <<'PY'\nprint('{rm_home}')\nPY")
+        self.assert_allowed("echo $((1<<2))\necho ok")
+        # Bodies a shell executes, or `$(...)` that still expands, stay inspected.
+        self.assert_blocked(f"cat <<'EOF' | bash\n{rm_home}\nEOF")
+        self.assert_blocked(f"bash <<'EOF'\n{rm_home}\nEOF")
+        self.assert_blocked(f"cat > a.txt <<EOF\n$({rm_home})\nEOF")
+        self.assert_blocked(f"cat > a.txt <<EOF\n'$({rm_home})'\nEOF")
+        # Parser-confusion attempts fall back to inspecting the text as commands.
+        self.assert_blocked(f"cat <<EOF\n{rm_home}")
+        self.assert_blocked(f"echo hi # <<X\n{rm_home}\nX")
+        self.assert_blocked(f"echo $((1<<X))\n{rm_home}\nX")
+
+    def test_gh_api_rest_writes_that_publish(self) -> None:
+        self.assert_blocked("gh api -X POST /user/repos -f name=leak -F private=false")
+        self.assert_blocked("gh api /user/repos -f name=leak")
+        self.assert_blocked("gh api --method POST orgs/acme/repos -f name=leak")
+        self.assert_blocked("gh api https://api.github.com/user/repos -f name=x")
+        self.assert_blocked("gh api -X PATCH /repos/o/r -f visibility=public")
+        self.assert_blocked("gh api -X PATCH repos/o/r --input body.json")
+        self.assert_blocked("gh api -X DELETE /repos/o/r")
+        self.assert_blocked("gh api /gists -F public=true -f 'files[a.png][content]=x'")
+        self.assert_blocked(
+            "gh api graphql -f query='mutation { createRepository(input:{name:\"x\", visibility:PUBLIC}) { repository { url } } }'"
+        )
+        self.assert_allowed("gh api /repos/o/r/pulls")
+        self.assert_allowed("gh api -X POST /repos/o/r/issues/1/comments -f body=hi")
+        self.assert_allowed("gh api -X POST /user/repos -f name=x -F private=true")
+
 
 class TestStopVerifyLoopBreaker(unittest.TestCase):
     def setUp(self) -> None:
@@ -274,6 +308,82 @@ class TestHardenSkillsAndDoctor(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual((claude_dir / "settings.json").read_text(encoding="utf-8"), original_txt)
         self.assertFalse((codex_rules / "paos-guardrails.rules").exists())
+
+    def test_harden_fail_closed_protected_runtime_and_static_claude_block(self) -> None:
+        claude_dir = self.home / ".claude"
+        claude_dir.mkdir(parents=True)
+        legacy = {
+            "permissions": {
+                "deny": ["Write(~/.claude/**)", "Edit(~/.claude/**)", "Write(~/.ssh/**)", "Edit(~/.ssh/**)", "Write(docs/**)"]
+            },
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.claude/hooks/pre_tool_gate.py"}]}
+                ]
+            },
+        }
+        (claude_dir / "settings.json").write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+
+        apply_harden(REPO_ROOT, home_dir=self.home, configure_git=False)
+        merged = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+
+        gate_entries = merged["hooks"]["PreToolUse"]
+        self.assertEqual(len(gate_entries), 1)
+        self.assertEqual(gate_entries[0]["hooks"][0]["onFailure"], "block")
+        self.assertEqual(gate_entries[0]["matcher"], "Bash|Write|Edit|MultiEdit|NotebookEdit")
+        ss_cmds = [h["command"] for e in merged["hooks"]["SessionStart"] for h in e["hooks"]]
+        self.assertEqual(ss_cmds, ["~/.claude/hooks/load_recent_memory.py"])
+
+        deny = merged["permissions"]["deny"]
+        for gone in ("Write(~/.claude/**)", "Edit(~/.claude/**)", "Write(~/.ssh/**)"):
+            self.assertNotIn(gone, deny)
+        self.assertIn("Edit(~/.ssh/**)", deny)
+        self.assertIn("Write(docs/**)", deny)  # a user rule without an Edit twin is left alone
+        self.assertIn("Edit(~/.claude/settings*.json)", deny)
+        self.assertIn("Edit(~/.claude/hooks/**)", deny)
+
+        hooks_dir = claude_dir / "hooks"
+        runtime = hooks_dir / "paos_runtime"
+        self.assertTrue((runtime / "paos" / "gate.py").is_file())
+        self.assertFalse(list(runtime.rglob("__pycache__")))
+        launcher = (hooks_dir / "pre_tool_gate.py").read_text(encoding="utf-8")
+        self.assertIn(repr(str(runtime.resolve())), launcher)
+        self.assertNotIn(str(REPO_ROOT / "lib"), launcher)
+
+        env = os.environ.copy()
+        env["PAOS_HOME_DIR"] = str(self.home)
+
+        def run_launcher(cmd: str) -> int:
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            return subprocess.run(
+                [str(hooks_dir / "pre_tool_gate.py")], input=payload, env=env, text=True, capture_output=True, timeout=10
+            ).returncode
+
+        self.assertEqual(run_launcher("git push -f origin main"), 2)
+        self.assertEqual(run_launcher("git status"), 0)
+        tamper = run_gate(
+            {"tool_name": "Edit", "tool_input": {"file_path": str(runtime / "paos" / "gate.py")}}, home_dir=self.home
+        )
+        self.assertEqual(tamper.returncode, 2)
+
+        # Second run refreshes the runtime in place and keeps settings unchanged.
+        res2 = apply_harden(REPO_ROOT, home_dir=self.home, configure_git=True)
+        self.assertFalse(res2["changed"])
+        self.assertTrue((runtime / "paos" / "gate.py").is_file())
+        doc_after = run_doctor(workspace=REPO_ROOT, home_dir=self.home)
+        self.assertEqual(doc_after["score"], 100, f"Unexpected doctor findings: {doc_after['findings']}")
+        self.assertEqual(doc_after["summary"]["warn"], 0)
+        self.assertEqual(doc_after["summary"]["fail"], 0)
+
+        # With SessionStart wired, CLAUDE.md stays static while hook-less clients still get TODAY.
+        ib = init_brain(home_dir=self.home)
+        (Path(ib["brain_dir"]) / "memory" / "TODAY.md").write_text("- [ ] P0: ship gate fix\n", encoding="utf-8")
+        sync_brain(home_dir=self.home, targets=["claude", "codex"])
+        claude_md = (claude_dir / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertNotIn("ship gate fix", claude_md)
+        self.assertIn("SessionStart", claude_md)
+        self.assertIn("@~/.paos/brain/CORE_RULES.md", claude_md)
+        self.assertIn("ship gate fix", (self.home / ".codex" / "AGENTS.md").read_text(encoding="utf-8"))
 
     def test_skill_name_traversal_guard_and_zero_match_protection(self) -> None:
         sk_dir = self.home / ".claude" / "skills"
@@ -602,6 +712,8 @@ class TestPaosKernelPrimitives(unittest.TestCase):
             c_locked = execute_cron_job_now("weekly-hygiene", repo_dir=REPO_ROOT, home_dir=self.home, notify=False)
             self.assertEqual(c_locked["status"], "skipped_locked")
         finally:
+            if holder.stdout is not None:
+                holder.stdout.close()
             holder.kill()
             holder.wait(timeout=5)
 

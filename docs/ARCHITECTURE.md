@@ -8,7 +8,7 @@
 
 1. **不可变护栏与审计区（`~/.claude/hooks/`、`~/.codex/rules/`、`~/.paos/logs/`）**
    - 部署在业务代码仓之外，通过 `templates/claude-user-settings.json`（`harden.py` 的唯一声明式配置真源）锁死 OS 沙盒 `denyRead` / `denyWrite` 与内置 `permissions.deny`，防止 Agent 被提示词注入后读取 `~/.paos/config.json` 或篡改钩子、`cron_jobs.json`、`LaunchAgents` 与 `.git/hooks`。
-   - `~/.claude/hooks/` 中的钩子均为轻量级统一入口，100% 委托给 `lib/paos/gate.py` 与 `lib/paos/audit.py` 执行，所有门禁拦截（`gate_block`）、验证熔断（`stuck_cap`）、任务调度（`task_run`）与盲审结论（`code_review`）共享同一套 DLP 正则脱敏与 5MB 自动轮转逻辑，彻底杜绝复制粘贴漂移。
+   - `~/.claude/hooks/` 中的钩子均为轻量级统一入口，100% 委托给 `paos harden` 复制进 `~/.claude/hooks/paos_runtime/` 的 `paos.gate` 与 `paos.audit` 执行（不 import 工作区源码，Agent 无法通过改仓库代码拆掉门禁），门禁钩子带 `"onFailure": "block"`，脚本异常、缺解释器或超时一律拦截；所有门禁拦截（`gate_block`）、验证熔断（`stuck_cap`）、任务调度（`task_run`）与盲审结论（`code_review`）共享同一套 DLP 正则脱敏与 5MB 自动轮转逻辑，彻底杜绝复制粘贴漂移。
 2. **跨端统一真源层（`~/.paos/`）**
    - `~/.paos/store/skills/`：全机唯一物理技能真源仓，根治跨客户端二级软链连环暴毙；
    - `~/.paos/brain/`：全机唯一的跨客户端共享核心契约（`CORE_RULES.md`、`USER.md`、`HEARTBEAT.md`）与纯文本记忆层（`MEMORY.md` ≤200 行硬上限、`TODAY.md`、`INBOX.md`、`learnings.md`），消除仓内与全局双轨状态分裂。
@@ -24,7 +24,7 @@
 `paos sync` 对四端统一采用**受管标记块（`<!-- PAOS:BEGIN --> ... <!-- PAOS:END -->`）**编译协议：
 - **100% 保护手写配置**：受管块外部的任何用户原有规则（含 Cursor `.mdc` 的 YAML Frontmatter 与自定义段落）原封不动保留，自动过滤受管内容中的嵌套标记并使用函数式正则替换防止反斜杠转义破坏；
 - **首次触碰强制备份**：首次向任何已有规则文件注入受管块前，自动备份原文件至 `~/.paos/backups/sync-<timestamp>/`，并支持 `paos sync --remove` 无损卸载；
-- **Prompt Cache 友好**：`SessionStart` 钩子动态注入每日聚焦与近两日日志（硬限流 ≤3,800 字符），避免高频改动静态规则文件击穿大模型前缀缓存。
+- **Prompt Cache 友好**：`SessionStart` 钩子（`paos harden` 全局注册）动态注入每日聚焦与近两日日志（硬限流 ≤3,800 字符）；钩子已注册时，`paos sync` 写进 `~/.claude/CLAUDE.md` 的受管块只保留静态 `@` 导入，动态内容只在一处注入，静态前缀不随每日待办变化。
 
 ---
 

@@ -21,11 +21,11 @@ fi
 
 echo "==> [1/4] 初始化 ~/.paos/brain 跨端共享大脑与本机档位配置..."
 "$PAOS_BIN" init
-"$PAOS_BIN" sync
 
 echo ""
-echo "==> [2/4] 非破坏性合并 Claude 沙盒钩子与 Codex Starlark 门禁 (自动备份已有配置)..."
+echo "==> [2/4] 非破坏性合并 Claude 沙盒钩子 (onFailure:block + paos_runtime) 与 Codex Starlark 门禁..."
 "$PAOS_BIN" harden --all
+"$PAOS_BIN" sync
 
 echo ""
 echo "==> [3/4] 运行词法级 PreToolUse 拦截器隔离自检 (临时沙盒日志，不污染真实 audit.jsonl)..."

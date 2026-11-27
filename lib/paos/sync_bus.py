@@ -274,6 +274,15 @@ def sync_brain(
     }
     hot_line = f"\n- 待晋升复发坑点提醒：{summary['hot_tags']}" if summary["hot_tags"] else ""
 
+    from .harden import claude_session_start_wired
+
+    if claude_session_start_wired(home):
+        # Today's focus, inbox and hot tags already arrive once per session via the SessionStart hook;
+        # keep CLAUDE.md static so it is not injected twice and its prefix stays cacheable.
+        claude_dynamic = "- 今日聚焦、收件箱计数与复发坑点由 SessionStart 钩子 (`~/.claude/hooks/load_recent_memory.py`) 每次开机注入"
+    else:
+        claude_dynamic = f"- 当前全局今日聚焦 (`~/.paos/brain/memory/TODAY.md`)：\n{summary['today_summary']}{hot_line}"
+
     compiled_blocks: Dict[str, Tuple[Path, str]] = {
         "claude": (
             home / ".claude" / "CLAUDE.md",
@@ -282,7 +291,7 @@ def sync_brain(
                 "@~/.paos/brain/CORE_RULES.md\n"
                 "@~/.paos/brain/USER.md\n"
                 "@~/.paos/brain/memory/MEMORY.md\n"
-                f"- 当前全局今日聚焦 (`~/.paos/brain/memory/TODAY.md`)：\n{summary['today_summary']}{hot_line}"
+                f"{claude_dynamic}"
             ),
         ),
         "codex": (

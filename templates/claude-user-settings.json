@@ -49,29 +49,18 @@
       "Read(~/.aws/**)",
       "Read(~/.config/gh/**)",
       "Read(~/.paos/config.json)",
-      "Write(~/.claude/**)",
-      "Edit(~/.claude/**)",
-      "Write(~/.codex/rules/**)",
+      "Edit(~/.claude/settings*.json)",
+      "Edit(~/.claude/hooks/**)",
       "Edit(~/.codex/rules/**)",
-      "Write(~/.paos/config.json)",
       "Edit(~/.paos/config.json)",
-      "Write(~/.paos/cron_jobs.json)",
       "Edit(~/.paos/cron_jobs.json)",
-      "Write(~/.paos/logs/**)",
       "Edit(~/.paos/logs/**)",
-      "Write(~/.paos/store/**)",
       "Edit(~/.paos/store/**)",
-      "Write(~/.ssh/**)",
       "Edit(~/.ssh/**)",
-      "Write(~/.aws/**)",
       "Edit(~/.aws/**)",
-      "Write(~/Library/LaunchAgents/**)",
       "Edit(~/Library/LaunchAgents/**)",
-      "Write(**/.claude/settings*.json)",
       "Edit(**/.claude/settings*.json)",
-      "Write(**/.claude/hooks/**)",
       "Edit(**/.claude/hooks/**)",
-      "Write(**/.git/hooks/**)",
       "Edit(**/.git/hooks/**)"
     ]
   },
@@ -82,7 +71,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/pre_tool_gate.py"
+            "command": "~/.claude/hooks/pre_tool_gate.py",
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/load_recent_memory.py",
+            "timeout": 15
           }
         ]
       }

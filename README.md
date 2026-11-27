@@ -69,6 +69,8 @@ $ paos use minimal -p
 - **操作系统**：macOS 或 Linux（Python `>= 3.9`，自带标准库即可，零第三方 `pip` 包依赖）
 - **基础工具**：`git`，以及至少安装并完成登录鉴权以下任一客户端 CLI：`claude`、`codex` 或 `agy`（Antigravity CLI）
 - **Linux 沙盒依赖提示**：`paos harden` 会开启 Claude 强制沙盒（`failIfUnavailable: true`），Linux 用户请确保系统已安装 `bubblewrap` (`bwrap`) 与 `socat`（macOS 使用系统内置 `sandbox-exec`，无需额外安装）
+- **Claude Code 版本**：`paos harden` 给门禁钩子写入 `"onFailure": "block"`（钩子脚本崩溃、找不到解释器或超时时拦截而不是放行），需要 Claude Code **v2.1.295 或更高**
+- **升级后重跑 `paos harden`**：钩子运行的是复制进受保护目录 `~/.claude/hooks/paos_runtime/` 的 `paos` 包副本，而不是工作区里的源码（Agent 改不了它，挪走仓库也不会让门禁失效）；更新或 `git pull` 后重跑一次 `paos harden` 才会刷新副本
 
 ---
 

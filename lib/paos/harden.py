@@ -22,6 +22,39 @@ HOOK_LAUNCHER_SPECS: Tuple[Tuple[str, str], ...] = (
     ("load_recent_memory.py", "run_session_start_main"),
 )
 GATE_COMMAND = "~/.claude/hooks/pre_tool_gate.py"
+SESSION_START_COMMAND = "~/.claude/hooks/load_recent_memory.py"
+# The gate runs from a copy of the `paos` package inside the protected `~/.claude/hooks/`, not from the
+# workspace checkout, so an agent editing the repo cannot rewrite the guard and moving the repo cannot break it.
+HOOK_RUNTIME_DIRNAME = "paos_runtime"
+# Rules older PAOS templates wrote that no longer belong: `Write(...)` never matches (Edit rules cover
+# Write/NotebookEdit), and `Edit(~/.claude/**)` also blocked Claude's own auto memory, skills and agents.
+LEGACY_DENY_RULES = {"Edit(~/.claude/**)", "Write(~/.claude/**)"}
+
+
+def _prune_legacy_deny(rules: List[Any]) -> List[Any]:
+    present = {r for r in rules if isinstance(r, str)}
+    out: List[Any] = []
+    for r in rules:
+        if isinstance(r, str):
+            if r in LEGACY_DENY_RULES:
+                continue
+            if r.startswith("Write(") and ("Edit(" + r[len("Write(") :]) in present:
+                continue  # no-op twin of an Edit rule
+        out.append(r)
+    return out
+
+
+def _find_wired_hook(entries: List[Any], script_names: Tuple[str, ...]) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        inner = entry.get("hooks")
+        if not isinstance(inner, list):
+            continue
+        for h in inner:
+            if isinstance(h, dict) and any(k in str(h.get("command") or "") for k in script_names):
+                return (entry, h)
+    return None
 
 
 def _dedup_extend(existing: List[Any], additions: List[Any]) -> List[Any]:
@@ -72,38 +105,46 @@ def merge_claude_settings(current: Dict[str, Any], repo_dir: Optional[Path] = No
     if not isinstance(perms, dict):
         perms = {}
         merged["permissions"] = perms
-    perms["deny"] = _dedup_extend(perms.get("deny") or [], tpl["permissions"]["deny"])
+    perms["deny"] = _prune_legacy_deny(_dedup_extend(perms.get("deny") or [], tpl["permissions"]["deny"]))
 
     hooks = merged.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         hooks = {}
         merged["hooks"] = hooks
-    pre_list = hooks.setdefault("PreToolUse", [])
-    if not isinstance(pre_list, list):
-        pre_list = []
-        hooks["PreToolUse"] = pre_list
 
-    target_matcher = tpl["hooks"]["PreToolUse"][0]["matcher"]
-    already_wired = False
-    for entry in pre_list:
-        if not isinstance(entry, dict):
+    for event, script_names, command in (
+        ("PreToolUse", ("pre_tool_gate.py", "block-destructive.sh"), GATE_COMMAND),
+        ("SessionStart", ("load_recent_memory.py",), SESSION_START_COMMAND),
+    ):
+        event_list = hooks.setdefault(event, [])
+        if not isinstance(event_list, list):
+            event_list = []
+            hooks[event] = event_list
+        tpl_entry = tpl["hooks"][event][0]
+        found = _find_wired_hook(event_list, script_names)
+        if found is None:
+            event_list.append(copy.deepcopy(tpl_entry))
             continue
-        inner = entry.get("hooks")
-        if isinstance(inner, list):
-            for h in inner:
-                if isinstance(h, dict) and any(
-                    k in str(h.get("command") or "")
-                    for k in ("pre_tool_gate.py", "block-destructive.sh")
-                ):
-                    h["command"] = GATE_COMMAND
-                    entry["matcher"] = target_matcher
-                    already_wired = True
-                    break
-
-    if not already_wired:
-        pre_list.append(copy.deepcopy(tpl["hooks"]["PreToolUse"][0]))
+        entry, h = found
+        entry["matcher"] = tpl_entry["matcher"]
+        h["command"] = command
+        for key, value in tpl_entry["hooks"][0].items():
+            if key not in ("type", "command"):
+                h[key] = value  # e.g. `onFailure: block`, so a crashed or missing gate stops the call
 
     return merged
+
+
+def claude_session_start_wired(home_dir: Optional[Path] = None) -> bool:
+    """True when `~/.claude/settings.json` registers the PAOS SessionStart memory hook."""
+    settings_path = paos_home(home_dir) / ".claude" / "settings.json"
+    try:
+        obj = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    hooks = obj.get("hooks") if isinstance(obj, dict) else None
+    entries = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    return isinstance(entries, list) and _find_wired_hook(entries, ("load_recent_memory.py",)) is not None
 
 
 def verify_codex_rules_file(rules_path: Path) -> Tuple[bool, List[str]]:
@@ -194,21 +235,41 @@ def apply_codex_harden(
     }
 
 
+def _install_hook_runtime(hooks_dst: Path) -> Path:
+    """Copy the active `paos` package into `~/.claude/hooks/paos_runtime/` and return that parent dir.
+
+    `~/.claude/hooks/**` is covered by the sandbox `denyWrite`, the `Edit` deny rules and the gate itself,
+    so the code the hooks run cannot be edited by the agent the way a workspace checkout can.
+    """
+    src_pkg = Path(__file__).resolve().parent
+    runtime_parent = hooks_dst / HOOK_RUNTIME_DIRNAME
+    staging = hooks_dst / f".{HOOK_RUNTIME_DIRNAME}.tmp-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(src_pkg, staging / "paos", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    if runtime_parent.exists():
+        shutil.rmtree(runtime_parent)
+    os.replace(staging, runtime_parent)
+    return runtime_parent
+
+
 def _deploy_hook_launchers(repo_dir: Path, hooks_dst: Path) -> List[str]:
-    """Write thin executable hook launchers in `~/.claude/hooks/` wired to the active `paos` package parent."""
+    """Write thin executable hook launchers in `~/.claude/hooks/` that import the protected runtime copy."""
     pkg_parent = str(Path(__file__).resolve().parent.parent)
     py_exe = sys.executable or "/usr/bin/env python3"
     shebang = f"#!{py_exe}\n" if py_exe.startswith("/") else "#!/usr/bin/env python3\n"
     hooks_dst.mkdir(parents=True, exist_ok=True)
+    runtime_parent = str(_install_hook_runtime(hooks_dst))
     deployed: List[str] = []
 
     for script_name, entry_fn in HOOK_LAUNCHER_SPECS:
         dst = hooks_dst / script_name
         content = (
             shebang
-            + f'"""PAOS managed hook launcher -> {entry_fn}."""\n'
+            + f'"""PAOS managed hook launcher -> {entry_fn} (protected runtime copy; rerun `paos harden` after upgrading)."""\n'
             "import sys\n"
-            f"sys.path.insert(0, {pkg_parent!r})\n"
+            "sys.dont_write_bytecode = True\n"
+            f"sys.path.insert(0, {runtime_parent!r})\n"
             f"from paos.gate import {entry_fn}\n"
             'if __name__ == "__main__":\n'
             f"    sys.exit({entry_fn}())\n"
@@ -219,7 +280,7 @@ def _deploy_hook_launchers(repo_dir: Path, hooks_dst: Path) -> List[str]:
 
     hb_dst = hooks_dst / "heartbeat-run.sh"
     hb_dst.write_text(
-        f"#!/usr/bin/env bash\nset -euo pipefail\nPYTHONPATH={pkg_parent!r} exec {py_exe!r} -B -m paos cron run-now heartbeat \"$@\"\n",
+        f"#!/usr/bin/env bash\nset -euo pipefail\nPYTHONPATH={runtime_parent!r} exec {py_exe!r} -B -m paos cron run-now heartbeat \"$@\"\n",
         encoding="utf-8",
     )
     os.chmod(hb_dst, 0o755)

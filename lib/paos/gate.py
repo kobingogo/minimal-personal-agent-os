@@ -144,8 +144,115 @@ def matches_sensitive_read_path(raw_path: str, cwd: Optional[str] = None) -> boo
     return False
 
 
-def extract_command_substitutions(cmd: str) -> List[str]:
-    """Extract balanced `$(...)`, `<(...)`, `>(...)`, and `` `...` `` outside single quotes."""
+HEREDOC_OP_RE = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|(\\?)([^\s;|&<>()'\"]+))")
+# Commands that turn heredoc text into commands: a body on a line that runs one of these stays inline.
+HEREDOC_EXEC_WORDS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "sudo", "su", "ssh", "xargs", "eval", "source"}
+
+
+def _heredoc_line_executes_body(line: str) -> bool:
+    for piece in re.split(r"[;|&]+", line):
+        words = [posixpath.basename(w) for w in re.findall(r"[^\s;|&()<>]+", piece)]
+        if any(w in HEREDOC_EXEC_WORDS for w in words):
+            return True
+        if words and words[0] == ".":
+            return True
+    return False
+
+
+def strip_heredoc_bodies(cmd: str) -> Tuple[str, List[str]]:
+    """Drop heredoc bodies that are plain data so their text is not inspected as commands.
+
+    Returns `(cmd_without_data_bodies, bodies_with_expansion)`; the second list holds bodies of
+    unquoted delimiters, whose `$(...)` / backticks still run. Fail-safe: a body fed to a shell,
+    `xargs`, `sudo` or `eval`, a heredoc inside parentheses, and a body with no terminator line
+    all stay inline and are inspected as commands, exactly as before.
+    """
+    if "<<" not in cmd:
+        return (cmd, [])
+    out: List[str] = []
+    expanding: List[str] = []
+    pending: List[Tuple[str, bool, bool]] = []  # (delimiter, strip_tabs, quoted)
+    in_single = False
+    in_double = False
+    depth = 0
+    line_start = 0
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if ch == "\\" and not in_single and i + 1 < n:
+            out.append(cmd[i : i + 2])
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|("):
+                j = cmd.find("\n", i)
+                j = n if j == -1 else j
+                out.append(cmd[i:j])
+                i = j
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif depth == 0 and cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+                m = HEREDOC_OP_RE.match(cmd, i)
+                if m:
+                    dash, sq, dq, bslash, bare = m.groups()
+                    delim = sq if sq is not None else (dq if dq is not None else bare)
+                    quoted = sq is not None or dq is not None or bool(bslash)
+                    pending.append((delim, bool(dash), quoted))
+                    out.append(m.group(0))
+                    i = m.end()
+                    continue
+            elif ch == "\n" and pending:
+                executes = _heredoc_line_executes_body(cmd[line_start:i])
+                j = i + 1
+                bodies: List[Tuple[List[str], bool]] = []
+                terminated = True
+                for delim, strip_tabs, quoted in pending:
+                    body: List[str] = []
+                    found = False
+                    while j < n:
+                        k = cmd.find("\n", j)
+                        end = n if k == -1 else k
+                        ln = cmd[j:end]
+                        j = n if k == -1 else k + 1
+                        if (ln.lstrip("\t") if strip_tabs else ln) == delim:
+                            found = True
+                            break
+                        body.append(ln)
+                    if not found:
+                        terminated = False
+                        break
+                    bodies.append((body, quoted))
+                pending = []
+                if terminated and not executes:
+                    out.append("\n")
+                    expanding.extend("\n".join(b) for b, q in bodies if not q)
+                    i = j
+                    line_start = i
+                    continue
+                out.append(ch)
+                i += 1
+                line_start = i
+                continue
+            elif ch == "\n":
+                line_start = i + 1
+        out.append(ch)
+        i += 1
+    return ("".join(out), expanding)
+
+
+def extract_command_substitutions(cmd: str, honor_single_quotes: bool = True) -> List[str]:
+    """Extract balanced `$(...)`, `<(...)`, `>(...)`, and `` `...` `` outside single quotes.
+
+    Pass `honor_single_quotes=False` for heredoc bodies, where `'` is literal text.
+    """
     results: List[str] = []
     in_single = False
     i = 0
@@ -155,7 +262,7 @@ def extract_command_substitutions(cmd: str) -> List[str]:
         if ch == "\\" and not in_single and i + 1 < n:
             i += 2
             continue
-        if ch == "'":
+        if ch == "'" and honor_single_quotes:
             in_single = not in_single
             i += 1
             continue
@@ -448,6 +555,9 @@ def _check_gh(args: Sequence[str], cwd: str) -> None:
             continue
         break
     rem = args[idx:]
+    if rem and rem[0] == "api":
+        _check_gh_api(rem[1:], cwd=cwd)
+        return
     if len(rem) < 2:
         return
     noun, verb = rem[0], rem[1]
@@ -470,6 +580,73 @@ def _check_gh(args: Sequence[str], cwd: str) -> None:
         )
         if has_pub:
             _block("禁止自动创建公开 Gist (`gh gist create --public/-p`，防范数据外泄)。", cwd=cwd)
+
+
+GH_API_OPTS_WITH_VALUE = {
+    "-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--input",
+    "-q", "--jq", "-t", "--template", "--hostname", "-p", "--preview", "--cache",
+}
+GH_API_REPO_CREATE_RE = re.compile(r"(user|orgs/[^/]+)/repos|repos/[^/]+/[^/]+/(generate|forks)")
+GH_API_REPO_RE = re.compile(r"repos/[^/]+/[^/]+")
+
+
+def _check_gh_api(args: Sequence[str], cwd: str) -> None:
+    """Block raw `gh api` writes that create public repos/gists or flip a repo to public (PixelLeak via REST)."""
+    method = ""
+    endpoint = ""
+    fields: dict = {}
+    has_input = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-X") and len(a) > 2:
+            method = a[2:]
+            i += 1
+            continue
+        name, eq, inline_val = a.partition("=") if a.startswith("--") else (a, "", "")
+        if name in GH_API_OPTS_WITH_VALUE:
+            if eq:
+                val = inline_val
+                i += 1
+            elif i + 1 < len(args):
+                val = args[i + 1]
+                i += 2
+            else:
+                val = ""
+                i += 1
+            if name in ("-X", "--method"):
+                method = val
+            elif name in ("-f", "--raw-field", "-F", "--field"):
+                key, _, fval = val.partition("=")
+                fields[key.strip().lower()] = fval.strip().lower()
+            elif name == "--input":
+                has_input = True
+            continue
+        if not a.startswith("-") and not endpoint:
+            endpoint = a
+        i += 1
+
+    method = (method or ("POST" if fields or has_input else "GET")).upper()
+    if method in ("GET", "HEAD"):
+        return
+    ep = re.sub(r"^https?://[^/]+/", "", endpoint).lstrip("/").split("?", 1)[0].rstrip("/")
+
+    if GH_API_REPO_CREATE_RE.fullmatch(ep):
+        explicitly_private = fields.get("private") in ("true", "1") or fields.get("visibility") in ("private", "internal")
+        if has_input or not explicitly_private:
+            _block(f"禁止通过 `gh api {method} /{ep}` 直接创建非私有仓库（REST 默认公开，防范 PixelLeak 式外泄）。", cwd=cwd)
+    elif GH_API_REPO_RE.fullmatch(ep):
+        if method == "DELETE":
+            _block(f"禁止 Agent 通过 `gh api DELETE /{ep}` 删除远端仓库。", cwd=cwd)
+        if has_input or fields.get("private") in ("false", "0") or fields.get("visibility") == "public":
+            _block(f"禁止通过 `gh api {method} /{ep}` 把仓库改为公开可见（`--input` 载荷无法检查，一并拦截）。", cwd=cwd)
+    elif ep == "gists" or ep.startswith("gists/"):
+        if has_input or fields.get("public") in ("true", "1"):
+            _block(f"禁止通过 `gh api {method} /{ep}` 创建或改为公开 Gist（`--input` 载荷无法检查，一并拦截）。", cwd=cwd)
+    elif ep == "graphql":
+        query = fields.get("query", "")
+        if re.search(r"(createrepository|updaterepository|clonetemplaterepository)", query) and "public" in query:
+            _block("禁止通过 `gh api graphql` 创建或改为公开仓库。", cwd=cwd)
 
 
 def _strip_leading_keywords_and_subshell(seg: str) -> Optional[str]:
@@ -572,6 +749,12 @@ def inspect_command(cmd: str, depth: int = 0, cwd: Optional[str] = None) -> None
     eff_cwd = cwd or os.getcwd()
     if depth > 5:
         _block("命令嵌套层级过深，拒绝放行。", cwd=eff_cwd)
+
+    cmd, expanding_bodies = strip_heredoc_bodies(cmd)
+    for body in expanding_bodies:
+        for inner in extract_command_substitutions(body, honor_single_quotes=False):
+            if inner.strip():
+                inspect_command(inner, depth + 1, cwd=eff_cwd)
 
     for inner in extract_command_substitutions(cmd):
         if inner.strip():
